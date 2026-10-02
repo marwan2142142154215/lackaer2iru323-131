@@ -268,8 +268,8 @@ Sumber kebenaran: `server/src/commands/catalog.js`.
 | Type | TTL | Butuh online | Description |
 |---|---|---|---|
 | `lock` | 30 s | ya | Kunci layar + suspend app lain + matikan kamera |
-| `unlock` | 60 s | ya | Buka kunci, PIN baru dikirim ke admin |
-| `pin` | 30 s | ya | Ambil PIN layar kunci saat ini |
+| `unlock` | 60 s | ya | Buka kunci layar (`setKeyguardDisabled(false->true)`) |
+| `pin` | 30 s | ya | Ambil kode keeper terakhir (BUKAN PIN layar kunci) |
 | `set_kiosk` | 30 s | ya | Mode kios: hanya Guard yang bisa dibuka |
 | `locate` | 45 s | ya | Ambil lokasi sekali, akurasi tinggi |
 | `track_start` | 30 s | ya | Kirim lokasi terus-menerus |
@@ -293,6 +293,30 @@ Aturan antrean (`src/commands/dispatcher.js`):
 3. Lewat `expires_at` → status `expired`.
 4. Maksimal `QUEUE_MAX_DEPTH` (default 40) per device; lebih dari itu ditolak.
 5. `cooldownSec` per type mencegah spam (misal `lock` 3 detik).
+
+### Catatan penting: tidak ada PIN layar kunci anymore
+
+Android 11+ mengubah API ini. `DevicePolicyManager.resetPassword(ComponentName,
+String)` yang dulu dipakai Guard untuk memasang PIN sudah **dihapus** dari SDK
+publik; satu-satunya overload yang tersisa adalah
+`resetPassword(String adminPackage, int flags)` yang justru **menghapus**
+kredensial layar kunci.
+
+Konsekuensi ke protocol:
+
+- `/unlock` tidak lagi mengirim PIN. Ia memanggil `setKeyguardDisabled(admin, true)`,
+  yaitu mematikan keyguard sepenuhnya. Ini berlaku lintas versi
+  (Android 10-16) dan tidak bergantung pada API yang sudah hilang.
+- `/set_pin` dan `/pin` kini menyimpan serta melaporkan **kode keeper** -
+  angka acak 8 karakter sebagai referensi operator saat merespons. Kode ini
+  **bukan** PIN layar kunci, **tidak bisa dipakai membuka layar**, dan
+  tidak ada di layar kunci HP sama sekali.
+- Upaya penyewa memasang kredensial baru dicegat `onPasswordChanged` dan
+  langsung dinetralkan dengan `setKeyguardDisabled(admin, true)` lagi.
+
+Jadi tidak ada lagi alur "PIN dikirim ke operator lalu diketik ulang". Untuk
+rental ini justru menghasilkan kondisi yang lebih ketat: tidak ada PIN yang
+bisa ditebak, dan tidak ada PIN yang bisa diubah penyewa diam-diam.
 
 ---
 

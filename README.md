@@ -12,7 +12,7 @@ APK Guard (DPC / Device Owner)  ⇄  Server broker (PC lokal)  ⇄  Bot Telegram
 > **Aturan emas arsitektur:** APK Guard **tidak pernah** bicara langsung ke bot
 > Telegram. Semua perintah masuk dari server broker, semua laporan keluar ke
 > server broker. Ini yang membuat "salah kirim command ke unit yang salah" secara
-> struktural mustahil, bukan sekadar dicek denganitian.
+> struktural mustahil, bukan sekadar dicek dengan test.
 
 ---
 
@@ -20,22 +20,28 @@ APK Guard (DPC / Device Owner)  ⇄  Server broker (PC lokal)  ⇄  Bot Telegram
 
 | Bagian | Status | Catatan |
 |---|---|---|
-| Server broker (Node.js, WSS + HTTP + dashboard) | Selesai & diuji | 14/14 self-test, 23/23 bot-test |
+| Server broker (Node.js, WSS + HTTP + dashboard) | Selesai & diuji | 15/15 self-test, 23/23 bot-test |
 | Bot Telegram (15 command + fuzzy match) | Selesai & diuji | whitelist chat_id, RBAC, audit |
 | Skema DB SQLite + PostgreSQL | Selesai | dual driver, nol dependency native |
 | Onboarding massal (QR + NFC NDEF + CSV) | Selesai | `scripts/onboard.mjs` |
-| APK Guard (Kotlin, Device Owner) | **Sumber lengkap, belum dikompilasi** | Android Studio + SDK sudah ada, tinggal `Build > Build APK(s)`. Lihat [docs/06-build-apk.md](docs/06-build-apk.md) |
+| APK Guard (Kotlin, Device Owner) | **Selesai & ditandatangani** | `dist/guard-1.0.0-release.apk` + `dist/guard-1.0.0-debug.apk`. Lihat [docs/06-build-apk.md](docs/06-build-apk.md) |
 | Dokumentasi & infra | Selesai | `docs/`, `infra/` |
 
-Satu-satunya bagian sistem yang **belum pernah dieksekusi** adalah
-kompilasi APK. Untuk itu sudah diperiksa dan tersedia di mesin ini:
-JDK 25 (JBR Android Studio), Android SDK dengan build-tools 36.0.0, dan
-Android Studio itu sendiri. Yang belum ada adalah distribusi Gradle —
-Android Studio mengunduhnya sendiri saat project dibuka. Rincian toolchain
-dan rakit fallback-nya ada di [docs/06-build-apk.md](docs/06-build-apk.md).
+Kedua APK sudah benar-benar dikompilasi dan diverifikasi tanda tangannya,
+bukan sekadar source code:
 
-Provisioning DPC lewat ZTE tetap belum bisa diverifikasi karena butuh akun
-Android Device Provisioning Partner dan perangkat nyata.
+| Artefak | Package | Ukuran | Signing |
+|---|---|---|---|
+| `dist/guard-1.0.0-release.apk` | `id.acefleet.guard` | 1.16 MB | `CN=Fleet Guard` (R8 shrunk) |
+| `dist/guard-1.0.0-debug.apk` | `id.acefleet.guard.debug` | 8.24 MB | `CN=Android Debug` |
+
+Toolchain Android di-bootstrap manual (JDK 25 + SDK platform 36 + Gradle 9.5.0)
+karena `cmdline-tools` tidak ada di mesin ini. Semua error compile Kotlin
+diperbaiki berdasarkan `javap` terhadap `android.jar` API 36, bukan asumsi.
+
+Yang **belum** bisa diverifikasi: pairing ke HP nyata, provisioning DPC lewat
+ZTE, dan burn-test policy di lapangan. Semuanya butuh perangkat nyata dan
+akun Android Device Provisioning Partner.
 
 ---
 
@@ -126,10 +132,23 @@ Lalu masukkan `1234567890` ke `ADMIN_CHAT_IDS` di `.env` dan restart server.
 
 ## Uji
 
+Butuh server jalan. Urutannya penting: simulator hanya bisa menghubungkan
+device yang sudah terdaftar di DB, jadi seed dulu.
+
 ```powershell
-node scripts/selftest.mjs    # 14 uji integrasi broker (butuh server jalan)
-node scripts/bottest.mjs     # 23 uji handler bot (tanpa jaringan Telegram)
-node scripts/simulator.mjs --count 4   # 4 device palsu untuk uji beban
+node scripts/seed-test-devices.mjs               # buat HP-001..HP-004 (data UJI)
+node scripts/simulator.mjs --count 4             # 4 device palsu, biarkan jalan
+node scripts/selftest.mjs                        # 15 uji integrasi broker
+node scripts/bottest.mjs                         # 23 uji handler bot (tanpa jaringan)
+```
+
+Setelah selesai menguji, **wajib** bersihkan supaya dashboard tidak menampilkan
+data palsu:
+
+```powershell
+node scripts/seed-test-devices.mjs --clean       # hapus hanya perangkat UJI
+# atau hapus semuanya (backup otomatis lebih dulu):
+node scripts/purge-devices.mjs --yes --keep-admin
 ```
 
 Pemeriksaan statis sumber APK (tanpa Android SDK):
@@ -138,6 +157,11 @@ Pemeriksaan statis sumber APK (tanpa Android SDK):
 node android\tools\check-sources.mjs android\app\src\main
 ```
 
+Catatan jujur: `check-sources.mjs` **tidak** memeriksa import maupun signature
+API Android. Saat build pertama dicoba, checker itu lolos 100% padahal ada ~40
+error compile. Untuk kode Android, uji build Gradle satu-satunya sumber
+kebenaran.
+
 ---
 
 ## Peringatan yang harus dibaca sebelum produksi
@@ -145,12 +169,12 @@ node android\tools\check-sources.mjs android\app\src\main
 1. **Token bot Telegram pernah bocor.** Kalau token ini pernah dikirim lewat
    chat/email, **wajib** `/revoke` di @BotFather lalu update `.env`. Token bot
    memberi kendali penuh atas semua unit.
-2. **`data/keyring.json` adalahNyawa sistem.** Tanpa file ini, seluruh token
+2. **`data/keyring.json` adalah nyawa sistem.** Tanpa file ini, seluruh token
    device dan data terenkripsi tidak bisa dipulihkan. Backup rutin
    (`node scripts/backup.mjs`) dan simpan salinannya di luar PC ini.
 3. **Anti-factory-reset bukan anti-curian.** Zero-Touch + Device Owner mencegah
    penyewa keluar dari sistem lewat factory reset biasa, tapi tidak mencegah
-   unit hilang dibawa kabur. Untuk itu perlu_combination dengan
+   unit hilang dibawa kabur. Untuk itu perlu kombinasi dengan
    **GSMA Device Check** (blocklist IMEI) dan kesepakatan insurance.
    Detail jujur: [docs/05-android-policy.md](docs/05-android-policy.md).
 4. **Server harus bisa dijangkau dari internet** dengan WSS + TLS asli, bukan

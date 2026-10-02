@@ -14,8 +14,17 @@ karena urutan wajibnya adalah uninstall debug dulu, baru pasang release.
 Sidik jari sertifikat release (isi `GUARD_DPC_SIGNATURE_SHA1`):
 
 ```
-01:C7:38:6E:42:A0:B2:8A:27:B2:7E:CB:6C:2C:A8:0A:13:5D:FB:95
+97:15:79:55:BA:3F:3E:15:2F:3C:93:6A:55:5F:52:06:6D:89:92:9B
 ```
+
+> Nilai ini **berganti** dari `01:C7:38:...`. Keystore lama dibuat dengan
+> password yang sempat bocor di dokumen (§5b) dan sudah sempat ter-*push* ke
+> GitHub, jadi kuncinya dianggap kompromi lalu digenerate ulang. Semuanya
+> terjadi sebelum ada satu pun unit yang ter-provisioning, jadi tidak ada unit
+> yang perlu di-migrate.
+>
+> **Nilai di atas yang berlaku.** Kalau nanti berubah lagi, seluruh unit harus
+> di-provisioning ulang.
 
 ---
 
@@ -25,12 +34,13 @@ Sidik jari sertifikat release (isi `GUARD_DPC_SIGNATURE_SHA1`):
 |---|---|---|
 | JDK / JBR 25.0.3 | ✅ ada | `C:\Program Files\Android\Android Studio\jbr` |
 | Android Studio | ✅ ada | `C:\Program Files\Android\Android Studio` |
-| Android SDK platform | ⚠️ hanya `android-37.0` | `%LOCALAPPDATA%\Android\Sdk\platforms` |
+| Android SDK platform | ✅ `android-36` + `android-37.0` | `%LOCALAPPDATA%\Android\Sdk\platforms` |
 | Build-tools | ✅ `36.0.0` | `%LOCALAPPDATA%\Android\Sdk\build-tools` |
 | `platform-tools` (adb) | ❌ folder ada tapi **kosong** | — |
 | `cmdline-tools` / sdkmanager | ❌ tidak ada | — |
-| Gradle distribution | ✅ **sudah dipasang** (lihat §1b) | `~\.gradle-dist\gradle-9.8.0` |
-| SDK platform 36 | ✅ **sudah dipasang** (lihat §1b) | `%LOCALAPPDATA%\Android\Sdk\platforms\android-36` |
+| Gradle distribution | ✅ `9.5.0` **dipakai** (lihat §1b) | `~\.gradle-dist\gradle-9.5.0` |
+| | ⚠️ `9.8.0` ikut terunduh tapi **tidak dipakai** - AGP 8.13.2 rusak di atas 9.5.0 | `~\.gradle-dist\gradle-9.8.0` |
+| SDK platform 36 | ✅ sudah dipasang (lihat §1b) | `%LOCALAPPDATA%\Android\Sdk\platforms\android-36` |
 
 Konsekuensi: `gradlew` dan `gradle-wrapper.jar` tetap tidak ada (keduanya
 biner), **tapi tidak lagi dibutuhkan** — build bisa lewat CLI memakai Gradle
@@ -58,17 +68,30 @@ sudah ada). Jalankan ulang kapan saja untuk memastikan toolchain utuh.
 
 ### Kenapa Gradle 9.5.0 dan bukan yang terbaru
 
-Percobaan pertama memakai Gradle **9.8.0** (versi current) dan **gagal**:
+Percobaan dengan Gradle **9.8.0** (versi yang ikut terunduh) **gagal**. Ini
+keluaran verbatimnya:
 
 ```
-> Plugin 'com.android.internal.application' relies on
-  'org.gradle.api.problems.internal.InternalProblems', a Gradle internal API
-  that was removed in Gradle 9.6.0.
+* What went wrong:
+An exception occurred applying plugin request [id: 'com.android.application']
+> Failed to apply plugin 'com.android.internal.application'.
+   > Failed to create service '...AndroidProblemReporterProvider_...'.
+      > Could not create an instance of type AndroidProblemReporterProvider.
+         > Could not create service of type InternalProblems using
+           ProblemsBuildTreeServices.createInternalProblems().
+            > Plugin 'com.android.internal.application' relies on
+              'org.gradle.api.problems.internal.InternalProblems',
+a Gradle internal API that was removed in Gradle 9.6.0. Update the plugin to a
+version that no longer uses Gradle internal APIs, or use Gradle 9.5.
 ```
 
-Jadi 9.5.0 adalah batas atas yang masih kompatibel dengan AGP 8.13. Kalau
-AGP nanti diperbarui ke versi yang sudah lepas dari internal API, Gradle bisa
-naik lagi.
+Jadi **9.5.0 adalah batas atas** yang masih kompatibel dengan AGP 8.13.2.
+Naikkan Gradle ke 9.6+ hanya kalau AGP juga sudah diperbarui ke versi yang
+lepas dari internal API tersebut.
+
+Catatan untuk yang mau menelusuri sendiri: pesan itu berasal dari **Gradle**,
+bukan dari AGP. Kalau kamu grep string `InternalProblems` di dalam
+`gradle-8.13.2.jar`, hasilnya **nol** - grep di sana menyesatkan.
 
 ### Build lewat CLI (tanpa Android Studio)
 
@@ -250,12 +273,22 @@ bernama `[UJI] HP-001`. Setelah nama dinormalkan, 23/23 lulus.
 
 ## 5. Build produksi + keystore
 
-Build pertama **tidak butuh keystore** — `app/build.gradle.kts` sekarang
-mendeteksi `-PfleetStoreFile`: kalau file tidak ada, release build jatuh ke
-debug signing dan mencetak peringatan di konsol. Jadi `Build APK(s)` selalu
-berhasil.
+### Release build GAGAL kalau keystore tidak ada
 
-Setelah smoke-test lulus, buat keystore produksi:
+`app/build.gradle.kts` sengaja **menolak** menghasilkan APK release yang
+ditandatangani debug. Alasannya serius: Android menolak upgrade bila
+sertifikat berubah, dan Guard sebagai Device Owner tidak bisa di-uninstall.
+Satu tanda tangan yang salah berarti **seluruh unit harus di-wipe dan
+di-provisioning ulang**. Karena itu juga sidik jari sertifikat
+(`GUARD_DPC_SIGNATURE_SHA1`) tidak boleh berubah seumur operasional.
+
+| Kondisi | Hasil |
+|---|---|
+| `-PfleetStoreFile` menunjuk file yang ada | Ditandatangani `CN=Fleet Guard` |
+| `-PfleetStoreFile` hilang / file tidak ada | **BUILD GAGAL** dengan pesan jelas |
+| Ditambah `-PfleetAllowDebugSigningRelease=true` | Lolos, tapi peringatan keras di konsol. Smoke-test saja |
+
+Buat keystore produksi:
 
 ```
 keytool -genkeypair -v \
@@ -264,22 +297,61 @@ keytool -genkeypair -v \
 ```
 
 Simpan file itu **di luar folder project** (dan di luar PC ini kalau bisa).
-Keystore sekarang sudah dibuat di `android/keystore/guard-release.jks`, tapi
-folder itu ada di `.gitignore` - **tidak pernah** di-commit. Kalau bocor,
-rotasi semua token device dan password bot.
 
-Password yang dipakai saat membuat keystore repo ini:
-`storepass = keypass = [REDACTED-KEYSTORE-PASSWORD]`, alias `guard`.
+Baris build release:
 
-Baris untuk build release:
-
+```powershell
+$env:JAVA_HOME = "C:\Program Files\Android\Android Studio\jbr"
+Set-Location "C:\Users\ACE COMPUTER\Documents\lacak lah\fleet-guard\android"
+& "$env:USERPROFILE\.gradle-dist\gradle-9.5.0\bin\gradle.bat" assembleRelease --console=plain `
+  "-PfleetStoreFile=..\keystore\guard-release.jks" `
+  "-PfleetStorePassword=<dari keystore-pass.txt>" `
+  "-PfleetKeyAlias=guard" `
+  "-PfleetKeyPassword=<dari keystore-pass.txt>"
 ```
-gradle.bat assembleRelease --console=plain -PfleetStoreFile=C:/secure/guard-release.jks -PfleetStorePassword=... -PfleetKeyAlias=guard -PfleetKeyPassword=...
-```
+
+> **Path relatif dihitung dari `android/app/`, bukan dari `android/`.**
+> Karena itu path-nya ditulis `..\keystore\...`. Kalau menulis
+> `keystore\guard-release.jks`, Gradle akan mencarinya di
+> `android/app/keystore/` yang tidak ada, lalu build gagal dengan pesan
+> menyesatkan bahwa `-PfleetStoreFile` "tidak ditemukan". Pakai path absolut
+> kalau ragu.
+
+> **Password keystore tidak pernah ditulis di repo ini.** Passwordnya hanya
+> ada di `android/keystore/keystore-pass.txt` yang sudah di-`.gitignore`.
+> Jangan pernah menempelkan password ke dokumen, commit message, issue, atau
+> screenshot terminal. Lihat §5b untuk alasannya.
 
 Bonus: `-PfleetWsUrl=wss://host-anda/ws/v1/device` dan
 `-PfleetPairUrl=https://host-anda/api/enroll/pair` menyuntik alamat server
 langsung ke dalam APK, jadi tidak perlu ketik URL di setiap unit.
+
+### 5b. Kenapa password tidak boleh ada di repo
+
+Dokumen versi lama pernah memuat password keystore secara plaintext, dan itu
+sudah sempat ter-*push* ke GitHub. Password tersebut dihapus dari dokumen dan
+seluruh riwayat git (`git filter-repo --replace-text`), tapi kunci signing
+lama tetap dianggap **kompromi** dan digenerate ulang - untungnya masih
+sebelum ada satu pun unit yang ter-provisioning, jadi tidak ada unit yang
+perlu di-migrate.
+
+Kalau hanya mengganti password tanpa mengganti kuncinya, itu **tidak cukup**:
+vault lama harus dianggap sudah milik penyerang.
+
+Aturan yang berlaku:
+
+1. Password hanya di `keystore-pass.txt` (gitignored) atau password manager.
+2. Password bocor? **Generate ulang keystore**, jangan sekadar ganti password.
+3. Bekukan `GUARD_DPC_SIGNATURE_SHA1` selamanya. Mengganti sertifikat berarti
+   provisioning ulang seluruh unit.
+4. Hilangkan dari `git log` dengan `git filter-repo --replace-text`.
+5. **Commit dulu sebelum rewrite riwayat.** `git filter-repo` menjalankan
+   `reset --hard` di akhir, jadi perubahan yang belum di-commit hilang.
+6. Kalau menulis file pola untuk `--replace-text` dari PowerShell, pakai
+   `[System.IO.File]::WriteAllText($p, $isi, [UTF8Encoding]::new($false))`.
+   `Set-Content -Encoding UTF8` menulis BOM, dan BOM itu jadi bagian dari
+   pola sehingga tidak ada yang tergantikan - terlihat berhasil tapi
+   sebenarnya tidak.
 
 ### Untuk unit yang sudah ter-provisioning
 

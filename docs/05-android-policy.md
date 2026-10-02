@@ -146,10 +146,10 @@ ketahatan dalam setengah detik.
 | Kunci layar | `lockNow()` | `lockNow()` |
 | Matikan kamera | `setCameraDisabled(true)` | idem |
 | Matikan status bar | `setStatusBarDisabled(true)` | idem |
-| Halaman kios | `startLockTask()` | idem |
+| Halaman kios | `startLockTask()` (lewat refleksi) | idem |
 | Bekukan aplikasi lain | **tidak ada API resmi** → kunci layar berulang | `setPackagesSuspended(..., true)` |
-| Ganti PIN | `resetPassword()` | idem |
-| Ganti PIN otomatis tiap unit | `resetPassword()` | idem |
+| Buka layar kunci tanpa PIN | `setKeyguardDisabled(true)` | idem |
+| Hapus kredensial layar kunci | `resetPassword(package, flags)` | idem |
 
 ### Batas yang dinyatakan terbuka untuk Android 10–13
 
@@ -187,7 +187,7 @@ total".
 |---|---|
 | Fastboot / recovery wipe | Di luar kendali OS; aplikasi tidak berjalan |
 | Flash custom ROM | Bootloader unlock butuh Gesture/PIN yang sudah diganti Guard, tapi recovery tetap terbuka |
-| Hard power-off lalu tahan tombol | Butuh battery físicamente kosong |
+| Hard power-off lalu tahan tombol | Butuh baterai benar-benar kosong |
 | IMEI diblokir di jaringan lain | Perlu blocklist operator, bukan app |
 
 **Rekomendasi operasional untuk anti-curian sungguhan:**
@@ -208,7 +208,7 @@ total".
 |---|---|
 | Penyewa mematikan Guard dari Settings | `DISALLOW_INSTALL_APPS` + `setUninstallBlocked` + device owner |
 | Penyewa menyalakan debug USB | `DISALLOW_DEBUGGING_FEATURES` + `setStatusBarDisabled` |
-| Penyewa ganti PIN lalu reset | `DISALLOW_RESET_PIN` + `setMaximumFailedPasswordsForWipe(30)` |
+| Penyewa ganti PIN lalu reset | `setKeyguardDisabled` dinetralkan ulang + `setMaximumFailedPasswordsForWipe(30)`. `DISALLOW_RESET_PIN` **tidak ada** di SDK API 36 - sudah tidak bisa dipakai |
 | Penyewa uninstall via ADB | Device owner tidak bisa di-uninstall; `adb uninstall` ditolak |
 | Penyewa matiin GPS | Tidak dicegah — tapi geofence server tetap punya titik terakhir |
 | Serangan ke server | TLS, WSS only, HMAC challenge, token di-hash, whitelist chat_id |
@@ -259,7 +259,7 @@ Sebelum dikumpulkan ke penyewa, jalankan per unit:
 - [ ] `/lokasi` mengembalikan koordinat dalam 60 detik.
 - [ ] `/lock` → layar kunci dalam 1 detik; aplikasi lain tidak bisa dibuka.
 - [ ] `/kamera_belakang` → foto sampai di Telegram (bukan error izin).
-- [ ] `/unlock` → PIN baru diterima dan bisa dipakai untuk buka layar kunci.
+- [ ] `/unlock` → layar kunci terbuka tanpa perlu mengetik apa pun.
 - [ ] Matikan HP, nyalakan lagi → Guard aktif tanpa reset, `/status` online lagi.
 - [ ] Settings → Factory reset → **tidak ada** opsi / ditolak.
 - [ ] Settings → Apps → Guard → Uninstall → **tidak ada** / ditolak.

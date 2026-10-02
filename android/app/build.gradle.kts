@@ -27,12 +27,21 @@ android {
         buildConfigField("String", "PROTOCOL", "\"fleetguard.v1\"")
     }
 
-    // Keystore produksi OPSIONAL, supaya build pertama tidak mentok.
-    // -PfleetStoreFile=<path> dipakai hanya kalau file-nya benar-benar ada.
+    // Keystore produksi. -PfleetStoreFile=<path> dipakai hanya kalau file-nya
+    // benar-benar ada.
     val fleetKeystore: File? = project.findProperty("fleetStoreFile")
         ?.toString()
         ?.let { file(it) }
         ?.takeIf { it.isFile }
+
+    // Release TIDAK BOLEH diam-diam ditandatangani debug. Kalau begitu, APK
+    // terlihat seperti rilis padahal tidak bisa di-upgrade: Android menolak
+    // upgrade bila sertifikat berubah, dan DPC tidak bisa di-uninstall.
+    // Efeknya seluruh unit harus di-wipe & provisioning ulang. Jadi build
+    // berhenti, kecuali operator benar-benar meminta mode smoke-test.
+    val allowDebugSignedRelease =
+        (project.findProperty("fleetAllowDebugSigningRelease")?.toString() ?: "false")
+            .toBoolean()
 
     signingConfigs {
         if (fleetKeystore != null) {
@@ -53,13 +62,29 @@ android {
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             signingConfig = if (fleetKeystore != null) {
                 signingConfigs.getByName("fleet")
-            } else {
+            } else if (allowDebugSignedRelease) {
                 logger.lifecycle(
-                    "[fleet] keystore tidak ditemukan -> release memakai DEBUG signing. " +
-                        "APK ini HANYA untuk smoke-test, jangan dipakai produksi " +
-                        "(DPC menolak upgrade bila sertifikat berubah).",
+                    "[fleet] PERINGATAN: release ditandatangani DEBUG karena " +
+                        "-PfleetAllowDebugSigningRelease=true. Smoke-test saja, " +
+                        "JANGAN dipakai produksi.",
                 )
                 signingConfigs.getByName("debug")
+            } else {
+                throw GradleException(
+                    "Keystore produksi tidak ditemukan, sehingga release tidak bisa " +
+                        "ditandatangani dengan benar.\n" +
+                        "Build dihentikan agar tidak menghasilkan APK 'release' yang " +
+                        "sebenarnya bertanda tangan debug.\n" +
+                        "Alasannya: Android menolak upgrade bila sertifikat berubah, dan " +
+                        "sebagai Device Owner Guard tidak bisa di-uninstall - satu " +
+                        "tanda tangan salah berarti seluruh unit harus di-wipe ulang.\n\n" +
+                        "Cara benar (jalankan dari folder android/):\n" +
+                        "  -PfleetStoreFile=..\\keystore\\guard-release.jks " +
+                        "-PfleetStorePassword=<pw> " +
+                        "-PfleetKeyAlias=guard -PfleetKeyPassword=<pw>\n\n" +
+                        "Kalau memang hanya mau smoke-test, tambahkan:\n" +
+                        "  -PfleetAllowDebugSigningRelease=true",
+                )
             }
         }
         debug {
