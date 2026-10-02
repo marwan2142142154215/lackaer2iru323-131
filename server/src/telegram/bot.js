@@ -136,6 +136,7 @@ export class TelegramBot {
         { command: 'set_radius', description: 'Set radius geofence' },
         { command: 'rename', description: 'Ganti nama device' },
         { command: 'tambah_admin', description: 'Tambah admin baru (butuh sandi gerbang)' },
+        { command: 'mulai', description: 'Aktivasi Telegram pekerja' },
         { command: 'ganti_sandi', description: 'Ganti sandi login Anda' },
         { command: 'help', description: 'Bantuan' },
       ])
