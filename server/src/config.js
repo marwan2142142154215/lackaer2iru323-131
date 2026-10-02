@@ -109,6 +109,25 @@ export const config = {
   },
 };
 
+// GUARD_DPC_SIGNATURE_SHA1 masuk ke intent provisioning sebagai
+// PROVISIONING_DEVICE_ADMIN_SIGNATURE_CHECKSUM, yang dibandingkan sebagai hex.
+// Format base64 (yang pernah ditulis di dokumen lama) akan ditolak Android
+// tanpa pesan yang berguna, jadi format salah dicegat lebih awal di sini.
+{
+  const raw = String(config.enrollment.dpcSignatureSha1 || '').trim();
+  const clean = raw.replace(/[\s:]/g, '');
+  const looksHex = /^[0-9a-fA-F]{40}$/.test(clean);
+  if (raw && !looksHex) {
+    console.warn(
+      `[config] GUARD_DPC_SIGNATURE_SHA1 tidak terlihat seperti SHA-1 hex 40 karakter ` +
+        `(panjang saat ini ${clean.length}). Nilai yang diberikan: "${raw}". ` +
+        `Provisioning device owner akan DITOLAK. Format yang benar: 40 karakter ` +
+        `hex tanpa titik, contoh 97157955ba3f3e152f3c936a555f52066d89929b.`,
+    );
+  }
+  config.enrollment.dpcSignatureSha1 = clean.toLowerCase();
+}
+
 fs.mkdirSync(config.runtime.mediaDir, { recursive: true });
 fs.mkdirSync(config.runtime.logDir, { recursive: true });
 

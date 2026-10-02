@@ -34,16 +34,35 @@ Hitung sidik jari sertifikat di PowerShell:
 
 ```powershell
 keytool -list -v -keystore guard.jks -alias guard | Select-String SHA1
-# "SHA1: AB:CD:EF:.." -> buang titik, lalu:
-$hex = (keytool -list -v -keystore guard.jks -alias guard | Select-String SHA1) -replace '.*: ','' -replace '[^A-F0-9]',''
-[Convert]::ToBase64String([byte[]]($hex -split '(..)' | Where-Object { $_ } | ForEach-Object { [Convert]::ToByte($_,16) }))
+# "SHA1: AB:CD:EF:.." -> buang titik dan titik dua, huruf kecil:
+$hex = (keytool -list -v -keystore guard.jks -alias guard | Select-String SHA1) `
+        -replace '.*: ','' -replace '[^0-9A-Fa-f]',''
+```
+
+Hasilnya **40 karakter hex tanpa titik**. Untuk keystore repo ini:
+
+```
+97157955ba3f3e152f3c936a555f52066d89929b
+```
+
+> **Formatnya hex, bukan base64.** Nilai ini dikirim sebagai
+> `PROVISIONING_DEVICE_ADMIN_SIGNATURE_CHECKSUM` dan Android membandingkannya
+> sebagai hex. Dokumentasi versi lama menyebut base64 - itu salah, dan
+> base64 akan ditolak tanpa pesan yang berguna. `src/config.js` sekarang
+> memeriksa formatnya saat start dan memberi peringatan kalau bukan 40 hex.
+
+Cara paling aman: verifikasi langsung dari APK-nya, bukan dari keystore:
+
+```powershell
+& "$env:LOCALAPPDATA\Android\Sdk\build-tools\36.0.0\apksigner.bat" verify `
+   --print-certs ..\dist\guard-1.0.0-release.apk | Select-String "SHA-1 digest"
 ```
 
 Isi hasilnya di `.env`:
 
 ```env
 GUARD_DPC_COMPONENT=id.acefleet.guard/id.acefleet.guard.GuardDeviceAdminReceiver
-GUARD_DPC_SIGNATURE_SHA1=<base64 dari langkah di atas>
+GUARD_DPC_SIGNATURE_SHA1=97157955ba3f3e152f3c936a555f52066d89929b
 ```
 
 > `GUARD_DPC_COMPONENT` **harus persis** sama dengan receiver yang terdaftar di
