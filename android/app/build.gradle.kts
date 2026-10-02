@@ -70,6 +70,28 @@ android {
                 )
                 signingConfigs.getByName("debug")
             } else {
+                // Sengaja TIDAK melempar error di sini. Blok buildTypes dievaluasi
+                // pada configuration phase, jadi melempar dari sini membuat
+                // assembleDebug ikut gagal. Penjaga yang benar dipasang lewat
+                // taskGraph.whenReady di bawah - dia hanya menyala kalau ada task
+                // release yang benar-benar dijadwalkan.
+                signingConfigs.getByName("debug")
+            }
+        }
+        debug {
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
+    }
+
+    // Penjaga release ditandatangani debug.whenReady berjalan setelah graf task
+    // terbentuk tapi sebelum eksekusi, jadi hanya menyala kalau release benar
+    //-benar dibangun. Ini yang membuat assembleDebug tetap bisa jalan tanpa
+    // keystore, sementara assembleRelease tetap gagal keras.
+    if (fleetKeystore == null && !allowDebugSignedRelease) {
+        gradle.taskGraph.whenReady {
+            val buildsRelease = allTasks.any { it.name.contains("Release") }
+            if (buildsRelease) {
                 throw GradleException(
                     "Keystore produksi tidak ditemukan, sehingga release tidak bisa " +
                         "ditandatangani dengan benar.\n" +
@@ -86,10 +108,6 @@ android {
                         "  -PfleetAllowDebugSigningRelease=true",
                 )
             }
-        }
-        debug {
-            applicationIdSuffix = ".debug"
-            versionNameSuffix = "-debug"
         }
     }
 

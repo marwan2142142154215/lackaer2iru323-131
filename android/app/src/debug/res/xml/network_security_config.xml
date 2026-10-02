@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  KHUSUS BUILD DEBUG. File ini_override file yang sama di src/main dan TIDAK
+  ikut ke APK release.
+
+  Gunanya supaya Guard bisa bicara dengan server broker di PC lokal saat
+  pengujian lapangan (http://192.168.x.x:8787), karena server lokal tidak
+  punya sertifikat TLS. Build main tetap cleartextTrafficPermitted="false"
+  dan hanya mengizinkan wss:// - itu yang dipakai produksi.
+
+  Kalau file ini bocor ke build release, seluruh aturan keamanan jaringan
+  Guard jadi tidak berlaku. Verifikasi:
+    aapt2 dump badging <apk> | findstr debug
+    atau bandingkan isi APK release dengan debug.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+
+    <debug-overrides>
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </debug-overrides>
+</network-security-config>

@@ -93,5 +93,32 @@ class GuardDeviceAdminReceiver : DeviceAdminReceiver() {
             val dpm = ctx.getSystemService(DevicePolicyManager::class.java) ?: return false
             dpm.isDeviceOwnerApp(component(ctx).packageName)
         }.getOrDefault(false)
+
+        /**
+         * True bila receiver Guard terdaftar sebagai device admin AKTIF.
+         *
+         * Penting karena tanpa admin aktif, semua panggilan
+         * addUserRestriction / setUninstallBlocked / setPackagesSuspended gagal
+         * diam-diam. Operator harus tahu unitnya belum terlindungi, bukan
+         * menganggap proteksi sudah aktif.
+         *
+         * Device Admin bisa diaktifkan pada unit yang sudah punya akun Google,
+         * jadi ini jalur proteksi dasar yang tetap tersedia di HP NON-DO.
+         */
+        fun isAdminActive(ctx: Context): Boolean = runCatching {
+            val dpm = ctx.getSystemService(DevicePolicyManager::class.java) ?: return false
+            dpm.isAdminActive(component(ctx))
+        }.getOrDefault(false)
+
+        /**
+         * Ringkasan level proteksi yang benar-benar aktif di unit ini.
+         * Dikirim ke server supaya dashboard menampilkan kenyataan, bukan
+         * asumsi.
+         */
+        fun protectionLevel(ctx: Context): String = when {
+            isDeviceOwner(ctx) -> "device_owner"
+            isAdminActive(ctx) -> "device_admin"
+            else -> "none"
+        }
     }
 }

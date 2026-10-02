@@ -61,18 +61,30 @@ class PolicyEngine(private val ctx: Context) {
         )
     }
 
-    /** Pembatasan dasar: aktif baik dalam kondisi unlocked maupun locked. */
+    /**
+     * Pembatasan dasar: aktif baik dalam kondisi unlocked maupun locked.
+     *
+     * PENTING - Android 14+ hanya mengizinkan sebagian user restriction untuk
+     * Device Admin biasa. Yang butuh Device Owner akan DITOLAK oleh sistem
+     * dengan "Caller does not hold the required permission". Fungsi ini
+     * menghitung berapa yang benar-benar berlaku supaya aplikasi tidak
+     * melaporkan "restrictions aktif" padahal semuanya ditolak.
+     */
     fun applyBaseRestrictions() {
         // Semua konstanta di bawah diverifikasi dengan javap terhadap
         // android.jar API 36. DISALLOW_RESET_PIN dan DISALLOW_APPLY_RESTRICTION
         // tidak ada lagi di SDK publik, jadi tidak dipakai.
-        setRestriction(UserManager.DISALLOW_FACTORY_RESET, true)
-        setRestriction(UserManager.DISALLOW_DEBUGGING_FEATURES, true)
-        setRestriction(UserManager.DISALLOW_INSTALL_UNKNOWN_SOURCES, true)
-        setRestriction(UserManager.DISALLOW_USER_SWITCH, true)
-        setRestriction(UserManager.DISALLOW_REMOVE_USER, true)
-        setRestriction(UserManager.DISALLOW_ADD_USER, true)
-        setRestriction(UserManager.DISALLOW_CONFIG_CREDENTIALS, true)
+        val wanted = listOf(
+            UserManager.DISALLOW_FACTORY_RESET,
+            UserManager.DISALLOW_DEBUGGING_FEATURES,
+            UserManager.DISALLOW_INSTALL_UNKNOWN_SOURCES,
+            UserManager.DISALLOW_USER_SWITCH,
+            UserManager.DISALLOW_REMOVE_USER,
+            UserManager.DISALLOW_ADD_USER,
+            UserManager.DISALLOW_CONFIG_CREDENTIALS,
+        )
+        var applied = 0
+        for (k in wanted) if (setRestriction(k, true)) applied++
 
         // Uninstall Guard dari UI mustahil. API ini menerima SATU package
         // (String), bukan array.
@@ -93,7 +105,17 @@ class PolicyEngine(private val ctx: Context) {
         runCatching { dpm.setKeyguardDisabled(admin, false) }
         noteBackupNotDisabled()
 
-        Logs.i(TAG, "base restrictions aktif")
+        // Laporan jujur: kalau cuma sebagian yang berlaku, sebutkan bahwa itu
+        // batas Device Admin, bukan proteksi penuh.
+        if (applied == wanted.size) {
+            Logs.i(TAG, "base restrictions aktif ($applied/${wanted.size})")
+        } else {
+            Logs.w(
+                TAG,
+                "base restrictions SEBAGIAN ($applied/${wanted.size}) - sisanya butuh Device Owner. " +
+                    "Factory reset TIDAK terlindungi tanpa Device Owner.",
+            )
+        }
     }
 
     /**
@@ -285,10 +307,42 @@ class PolicyEngine(private val ctx: Context) {
         }
     }
 
-    private fun setRestriction(key: String, value: Boolean) {
+    /**
+     * Terapkan/lepas satu user restriction. Mengembalikan true bila
+     * benar-benar berlaku.
+     *
+     * Jangan anggap exception sebagai satu-satunya kegagalan: pada Android 14+
+     * addUserRestriction() bisa TIDAK melempar apa pun tapi tetap tidak
+     * berlaku. Karena itu status dibaca balik lewat getUserRestrictions().
+     */
+    private fun setRestriction(key: String, value: Boolean): Boolean {
         runCatching {
             if (value) dpm.addUserRestriction(admin, key) else dpm.clearUserRestriction(admin, key)
         }.onFailure { Log.w(TAG, "restriction $key: ${it.message}") }
+        val effective = runCatching {
+            dpm.getUserRestrictions(admin).getBoolean(key, false)
+        }.getOrDefault(false)
+        if (effective != value) {
+            Log.w(TAG, "restriction $key TIDAK berlaku (minta=$value, aktual=$effective)")
+        }
+        return effective == value
+    }
+
+    /** Berapa user restriction yang benar-benar berlaku sekarang. */
+    fun appliedRestrictionCount(): Int {
+        val keys = listOf(
+            UserManager.DISALLOW_FACTORY_RESET,
+            UserManager.DISALLOW_DEBUGGING_FEATURES,
+            UserManager.DISALLOW_INSTALL_UNKNOWN_SOURCES,
+            UserManager.DISALLOW_USER_SWITCH,
+            UserManager.DISALLOW_REMOVE_USER,
+            UserManager.DISALLOW_ADD_USER,
+            UserManager.DISALLOW_CONFIG_CREDENTIALS,
+        )
+        return runCatching {
+            val r = dpm.getUserRestrictions(admin)
+            keys.count { r.getBoolean(it, false) }
+        }.getOrDefault(0)
     }
 
     /** Status ringkas untuk heartbeat. */
@@ -296,6 +350,13 @@ class PolicyEngine(private val ctx: Context) {
         "policyState" to cfg.policyState.name.lowercase(),
         "locked" to cfg.policyState.isLocked,
         "kiosk" to cfg.kioskEnabled,
+        // Level proteksi yang BENAR-BENAR aktif, dibaca dari sistem. Tanpa
+        // ini operator bisa melihat "policy terkirim" lalu menganggap unitnya
+        // terlindungi, padahal semua restriction gagal karena admin belum
+        // diaktifkan.
+        "protectionLevel" to id.acefleet.guard.GuardDeviceAdminReceiver.protectionLevel(ctx),
+        "adminActive" to id.acefleet.guard.GuardDeviceAdminReceiver.isAdminActive(ctx),
+        "deviceOwner" to id.acefleet.guard.GuardDeviceAdminReceiver.isDeviceOwner(ctx),
         // getCameraDisabled / getUserRestrictions adalah satu-satunya cara baca
         // status yang masih ada di SDK 36 (isCameraDisabled & isUserRestriction
         // sudah dihapus).
@@ -305,6 +366,9 @@ class PolicyEngine(private val ctx: Context) {
             dpm.getUserRestrictions(admin)
                 .getBoolean(UserManager.DISALLOW_FACTORY_RESET, false)
         }.getOrDefault(false),
+        // Berapa dari 7 restriction yang benar-benar berlaku. Tanpa ini,
+        // dashboard hanya bisa menebak.
+        "restrictionsApplied" to appliedRestrictionCount(),
         "appliedAt" to cfg.lastAppliedAt,
     )
 

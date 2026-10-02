@@ -15,12 +15,13 @@ import {
   mediaRepo,
   auditRepo,
   adminsRepo,
+  settingsRepo,
   eventsRepo,
   logEvent,
 } from '../db/repos.js';
 import { listCatalog } from '../commands/catalog.js';
 import { CommandError } from '../commands/catalog.js';
-import { decryptBuffer } from '../crypto/box.js';
+import { decryptBuffer, hashPassword, verifyPassword } from '../crypto/box.js';
 import { bus } from '../eventbus.js';
 
 const log = logger('bot');
@@ -43,15 +44,18 @@ const HELP = `<b>Fleet Guard - perintah</b>
 /tandai_hilang &lt;nama&gt;        status hilang + auto-lock + lacak cepat
 /tandai_disewa &lt;nama&gt; &lt;orang&gt;
 /tandai_tersedia &lt;nama&gt;
-/maintenance &lt;nama&gt; · / Maintenance selesai
+/maintenance &lt;nama&gt; Â· / Maintenance selesai
 /set_radius &lt;nama&gt; &lt;meter&gt;
-/lacak &lt;nama&gt; [menit] · /stop_lacak &lt;nama&gt;
+/lacak &lt;nama&gt; [menit] Â· /stop_lacak &lt;nama&gt;
 /kiosk &lt;nama&gt; on|off
 /rename &lt;lama&gt; &lt;baru&gt;
+/tambah_admin &lt;username&gt; &lt;sandi_gerbang&gt; &lt;sandi_baru&gt;
+/mulai &lt;username&gt; &lt;sandi&gt;      aktivasi Telegram pekerja
+/ganti_sandi &lt;sandi_lama_anda&gt; &lt;sandi_baru&gt;
 /reboot &lt;nama&gt;              (konfirmasi)
 /hapus_data &lt;nama&gt;           (konfirmasi 2x, permanen)
 /rotasi_token &lt;nama&gt;       |superadmin, putuskan device lama
-/perintah · /audit · /stat · /uji
+/perintah Â· /audit Â· /stat Â· /uji
 
 <b>Catatan:</b> nama boleh disingkat. Kalau ambigu, bot akan menampilkan
 daftar kandidat lebih dulu - tidak akan pernah mengirim command ke device
@@ -68,6 +72,34 @@ export class TelegramBot {
     this.sessions = new Map(); // chatId -> {action, candidates, at, deviceId, confirm}
     this.allowed = new Set(config.telegram.adminChatIds);
     this.lastCmd = new Map(); // anti-spam: chatId -> {cmd, at}
+    // Gerbang untuk menambah admin dari bot: hash scrypt dari sandi gerbang.
+    // Diambil dari env bila ada (mis. saat instalasi awal), selain itu dibaca
+    // dari app_settings. Disimpan hanya sebagai hash.
+    this.gateHash = null;
+  }
+
+  /**
+   * Resolusi hash sandi gerbang tambah-admin.
+   *
+   * Urutan prioritas:
+   *   1. SMB_GATE_PASSWORD di .env (cara instalasi awal)
+   *   2. baris app_settings['smb.gate']
+   * Kalau dua-duanya kosong, fitur /tambah_admin dimatikan (fail closed) -
+   * lebih baik operator memakai scripts/admin.mjs daripada jalur bot terbuka.
+   */
+  async resolveGateHash() {
+    if (this.gateHash) return this.gateHash;
+    const envPw = process.env.SMB_GATE_PASSWORD;
+    if (envPw) {
+      this.gateHash = hashPassword(envPw);
+      return this.gateHash;
+    }
+    const stored = await settingsRepo.get('smb.gate').catch(() => null);
+    if (stored) {
+      this.gateHash = stored;
+      return this.gateHash;
+    }
+    return null;
   }
 
   async start() {
@@ -102,6 +134,9 @@ export class TelegramBot {
         { command: 'tandai_tersedia', description: 'Tandai tersedia' },
         { command: 'sound', description: 'Bunyikan alarm' },
         { command: 'set_radius', description: 'Set radius geofence' },
+        { command: 'rename', description: 'Ganti nama device' },
+        { command: 'tambah_admin', description: 'Tambah admin baru (butuh sandi gerbang)' },
+        { command: 'ganti_sandi', description: 'Ganti sandi login Anda' },
         { command: 'help', description: 'Bantuan' },
       ])
       .catch(() => {});
@@ -126,7 +161,7 @@ export class TelegramBot {
             log.error('update gagal', { update: u.update_id, err: e.message });
             if (u.message?.chat?.id) {
               await this.tg
-                .send(u.message.chat.id, `⚠️ error: ${e.message}`)
+                .send(u.message.chat.id, `âš ï¸ error: ${e.message}`)
                 .catch(() => {});
             }
           }
@@ -171,6 +206,23 @@ export class TelegramBot {
     const text = (msg.text || msg.caption || '').trim();
     const authorized = await this.isAllowed(chatId);
     if (!authorized) {
+      const [cmdRaw, ...args] = text.split(/\s+/);
+      const cmd0 = (cmdRaw || '').split('@')[0].toLowerCase();
+      const joined = args.join(' ').trim();
+
+      // /mulai <username> <sandi> - jalur aktivasi pekerja.
+      //
+      // Kenapa perintah ini diterima SEBELUM whitelist: pemilik membuat akun
+      // pekerja lewat /tambah_admin, tapi pekerja harus menautkan Telegram-nya
+      // SENDIRI. Kalau owner yang mengetik, chat pekerja justru tertaut ke
+      // akun owner - dan pekerja tidak akan pernah bisa memakai bot.
+      //
+      // Perintah ini hanya membuka pintu; sisanya tetap lewat isAllowed()
+      // (sandi harus benar, akun harus aktif, dan chat belum dipakai akun lain).
+      if (cmd0 === '/mulai') {
+        return void (await this.cmdAktivasi(chatId, joined, msg));
+      }
+
       await auditRepo.write({
         actor: `tg:${chatId}`,
         action: 'access.denied',
@@ -187,8 +239,10 @@ export class TelegramBot {
         await this.tg
           .send(
             chatId,
-            `⛔️ Akses ditolak.\nChat ini <code>${chatId}</code> belum terdaftar sebagai admin.\n` +
-              `Pemilik server perlu menjalankan: <code>node scripts/admin.mjs chat &lt;username&gt; ${chatId}</code>`,
+            `â›”ï¸ Akses ditolak.\nChat ini <code>${chatId}</code> belum terdaftar sebagai admin.\n` +
+              `Kalau Anda pekerja, minta pemilik membuat akun lalu jalankan:\n` +
+              `<code>/mulai &lt;username&gt; &lt;sandi_anda&gt;</code>\n\n` +
+              `Pemilik server bisa juga menjalankan: <code>node scripts/admin.mjs chat &lt;username&gt; ${chatId}</code>`,
           )
           .catch(() => {});
       }
@@ -255,6 +309,10 @@ export class TelegramBot {
           return void (await this.cmdKiosk(chatId, rest));
         case '/rename':
           return void (await this.cmdRename(chatId, rest));
+        case '/tambah_admin':
+          return void (await this.cmdTambahAdmin(chatId, rest, msg));
+        case '/ganti_sandi':
+          return void (await this.cmdGantiSandi(chatId, rest));
         case '/reboot':
           return void (await this.askConfirm(chatId, rest, 'reboot', 'Reboot perangkat?'));
         case '/hapus_data':
@@ -271,11 +329,11 @@ export class TelegramBot {
         case '/uji':
           return void (await this.cmdSelftest(chatId));
         default:
-          return void (await this.tg.send(chatId, `❓ Command tidak dikenal: ${esc(cmd)}\n${HELP}`));
+          return void (await this.tg.send(chatId, `â“ Command tidak dikenal: ${esc(cmd)}\n${HELP}`));
       }
     } catch (e) {
       const msgText =
-        e instanceof CommandError ? `❌ ${e.message}` : `❌ Error: ${e.message}`;
+        e instanceof CommandError ? `âŒ ${e.message}` : `âŒ Error: ${e.message}`;
       await this.tg.send(chatId, msgText).catch(() => {});
       if (!(e instanceof CommandError)) log.error('command error', { cmd, err: e.message });
     }
@@ -292,7 +350,7 @@ export class TelegramBot {
       return null;
     }
     if (!query) {
-      await this.tg.send(chatId, '❓ Sebut nama device, contoh: <code>/status HP-001</code>');
+      await this.tg.send(chatId, 'â“ Sebut nama device, contoh: <code>/status HP-001</code>');
       return null;
     }
     const res = resolveDevice(devices, query);
@@ -302,7 +360,7 @@ export class TelegramBot {
       this.sessions.set(chatId, { action, candidates: res.candidates, at: Date.now() });
       await this.tg.send(
         chatId,
-        `🤔 <b>${esc(res.reason)}</b>\nPencarian: <code>${esc(query)}</code>\n\n${formatCandidates(
+        `ðŸ¤” <b>${esc(res.reason)}</b>\nPencarian: <code>${esc(query)}</code>\n\n${formatCandidates(
           res.candidates,
         )}\n\nPilih device yang benar di bawah:`,
         {
@@ -311,11 +369,11 @@ export class TelegramBot {
               .slice(0, 8)
               .map((d) => [
                 {
-                  text: `${d.is_online ? '🟢' : '⚫'} ${d.nama_device}`.slice(0, 60),
+                  text: `${d.is_online ? 'ðŸŸ¢' : 'âš«'} ${d.nama_device}`.slice(0, 60),
                   callback_data: `pick:${rid}:${d.device_id}`,
                 },
               ])
-              .concat([[{ text: '❌ Batal', callback_data: 'pickcancel' }]]),
+              .concat([[{ text: 'âŒ Batal', callback_data: 'pickcancel' }]]),
           },
         },
       );
@@ -323,7 +381,7 @@ export class TelegramBot {
     }
     await this.tg.send(
       chatId,
-      `❌ Device <code>${esc(query)}</code> tidak ditemukan.\nKetik <code>/daftar</code> untuk melihat semua nama.`,
+      `âŒ Device <code>${esc(query)}</code> tidak ditemukan.\nKetik <code>/daftar</code> untuk melihat semua nama.`,
     );
     return null;
   }
@@ -343,7 +401,7 @@ export class TelegramBot {
     }
     const stat = await devicesRepo.countByStatus();
     const lines = [
-      `<b>DAFTAR DEVICE</b>  total ${stat.total} · 🟢 online ${stat.online} · 🟧 disewa ${stat.disewa} · 🟥 hilang ${stat.hilang}`,
+      `<b>DAFTAR DEVICE</b>  total ${stat.total} Â· ðŸŸ¢ online ${stat.online} Â· ðŸŸ§ disewa ${stat.disewa} Â· ðŸŸ¥ hilang ${stat.hilang}`,
       '',
     ];
     for (const d of devices.slice(0, 60)) lines.push(deviceLine(d));
@@ -368,18 +426,18 @@ export class TelegramBot {
       `Status sewa : ${ICON.status[full.status_sewa]} ${full.status_sewa}${
         full.nama_penyewa ? ` (${esc(full.nama_penyewa)})` : ''
       }`,
-      `Kunci        : ${ICON.lock[full.policy_state] || '·'} ${full.policy_state}`,
+      `Kunci        : ${ICON.lock[full.policy_state] || 'Â·'} ${full.policy_state}`,
       `Koneksi      : ${full.is_online ? ICON.online + ' online' : ICON.offline + ' offline'} (terakhir ${ago(
         full.last_seen_at,
       )})`,
-      `Baterai      : ${batteryText(full.battery_level)}${full.charging ? ' ⚡ charging' : ''}`,
+      `Baterai      : ${batteryText(full.battery_level)}${full.charging ? ' âš¡ charging' : ''}`,
       `Jaringan     : ${esc(full.network_type || '-')} ${full.signal_dbm ?? ''} dBm`,
-      `Perangkat    : ${esc(full.manufacturer || '')} ${esc(full.model || '')} · Android ${
+      `Perangkat    : ${esc(full.manufacturer || '')} ${esc(full.model || '')} Â· Android ${
         full.android_version || '?'
-      } (API ${full.api_level ?? '?'}) · app ${full.app_version || '?'}`,
-      `Geofence     : ${full.geofence_armed ? `aktif ⌀${full.radius_meter} m` : 'nonaktif'}`,
+      } (API ${full.api_level ?? '?'}) Â· app ${full.app_version || '?'}`,
+      `Geofence     : ${full.geofence_armed ? `aktif âŒ€${full.radius_meter} m` : 'nonaktif'}`,
       `Lokasi       : ${
-        loc ? `${loc.lat.toFixed(5)}, ${loc.lng.toFixed(5)} (±${loc.accuracy ?? '?'}m) ${fmtTime(loc.ts)}` : 'belum ada'
+        loc ? `${loc.lat.toFixed(5)}, ${loc.lng.toFixed(5)} (Â±${loc.accuracy ?? '?'}m) ${fmtTime(loc.ts)}` : 'belum ada'
       }`,
       `IMEI         : ${esc(full.imei || '-')}`,
     ];
@@ -388,7 +446,7 @@ export class TelegramBot {
       for (const c of cmds) {
         out.push(
           `#${c.id} <code>${esc(c.command_type)}</code> ${c.status} ${c.created_at.slice(11, 19)}${
-            c.error ? ` · ${esc(c.error)}` : ''
+            c.error ? ` Â· ${esc(c.error)}` : ''
           }`,
         );
       }
@@ -396,7 +454,7 @@ export class TelegramBot {
     if (evs.length) {
       out.push('', `<b>5 event terakhir</b>`);
       for (const e of evs) {
-        out.push(`• ${esc(e.event)} — ${fmtTime(e.created_at)}${e.severity !== 'info' ? ` (${e.severity})` : ''}`);
+        out.push(`â€¢ ${esc(e.event)} â€” ${fmtTime(e.created_at)}${e.severity !== 'info' ? ` (${e.severity})` : ''}`);
       }
     }
     await this.tg.send(chatId, out.join('\n'), { reply_markup: kbDevice(full, full.device_id) });
@@ -414,7 +472,7 @@ export class TelegramBot {
     if (!online && !silentOffline) {
       await this.tg.send(
         chatId,
-        `⏳ <b>${esc(device.nama_device)}</b> sedang OFFLINE.\nCommand <code>${type}</code> (#${res.id}) masuk antrean dan dikirim otomatis saat device online kembali.`,
+        `â³ <b>${esc(device.nama_device)}</b> sedang OFFLINE.\nCommand <code>${type}</code> (#${res.id}) masuk antrean dan dikirim otomatis saat device online kembali.`,
       );
     }
     return res;
@@ -430,7 +488,7 @@ export class TelegramBot {
     await logEvent(d.device_id, 'lock_issued', 'info', { reason, by: chatId });
     await this.tg.send(
       chatId,
-      `🔒 <b>${esc(d.nama_device)}</b> dikunci.\nHP hanya bisa dibuka lewat /unlock. Semua app disuspensi, kamera dimatikan, factory reset diblokir.`,
+      `ðŸ”’ <b>${esc(d.nama_device)}</b> dikunci.\nHP hanya bisa dibuka lewat /unlock. Semua app disuspensi, kamera dimatikan, factory reset diblokir.`,
     );
   }
 
@@ -438,16 +496,16 @@ export class TelegramBot {
     const d = await this.pickDevice(chatId, query, 'unlock');
     if (!d) return;
     if (!this.hub.isOnline(d.device_id)) {
-      await this.tg.send(chatId, `⚠️ ${esc(d.nama_device)} offline - command unlock diantre.`);
+      await this.tg.send(chatId, `âš ï¸ ${esc(d.nama_device)} offline - command unlock diantre.`);
     }
     const res = await this.issue(chatId, d, 'unlock', {});
     const done = await this.d.awaitResult(res.id, 60_000);
-    if (!done.ok) return void (await this.tg.send(chatId, `⚠️ Unlock gagal/tidak dijawab: ${done.error || '-'}`));
+    if (!done.ok) return void (await this.tg.send(chatId, `âš ï¸ Unlock gagal/tidak dijawab: ${done.error || '-'}`));
     await devicesRepo.update(d.device_id, { is_locked: 0 });
     const pin = done.data?.pin;
     await this.tg.send(
       chatId,
-      `🔓 <b>${esc(d.nama_device)}</b> terbuka.\n${
+      `ðŸ”“ <b>${esc(d.nama_device)}</b> terbuka.\n${
         pin ? `PIN layar kunci: <code>${esc(pin)}</code> (simpan, hanya ditampilkan sekali)` : ''
       }`,
     );
@@ -458,14 +516,14 @@ export class TelegramBot {
     if (!d) return;
     const res = await this.issue(chatId, d, 'pin', {});
     const done = await this.d.awaitResult(res.id, 40_000);
-    if (!done.ok) return void (await this.tg.send(chatId, `⚠️ Gagal ambil PIN: ${done.error || '-'}`));
+    if (!done.ok) return void (await this.tg.send(chatId, `âš ï¸ Gagal ambil PIN: ${done.error || '-'}`));
     await this.tg.send(
       chatId,
-      `🔑 PIN <b>${esc(d.nama_device)}</b>: <code>${esc(done.data?.pin || '?')}</code>\n<i>pesan ini bisa dihapus oleh admin</i>`,
+      `ðŸ”‘ PIN <b>${esc(d.nama_device)}</b>: <code>${esc(done.data?.pin || '?')}</code>\n<i>pesan ini bisa dihapus oleh admin</i>`,
     );
     await this.tg
-      .send(chatId, '🔑 PIN (rahasia): hapus pesan ini setelah dicatat.', {
-        reply_markup: { inline_keyboard: [[{ text: '🗑 Hapus pesan', callback_data: 'del' }]] },
+      .send(chatId, 'ðŸ”‘ PIN (rahasia): hapus pesan ini setelah dicatat.', {
+        reply_markup: { inline_keyboard: [[{ text: 'ðŸ—‘ Hapus pesan', callback_data: 'del' }]] },
       })
       .catch(() => {});
   }
@@ -474,16 +532,16 @@ export class TelegramBot {
     const d = await this.pickDevice(chatId, query, 'locate');
     if (!d) return;
     if (!this.hub.isOnline(d.device_id))
-      return void (await this.tg.send(chatId, `⚫ ${esc(d.nama_device)} offline - lokasi terakhir tidak bisa diperbarui.`));
+      return void (await this.tg.send(chatId, `âš« ${esc(d.nama_device)} offline - lokasi terakhir tidak bisa diperbarui.`));
     const res = await this.issue(chatId, d, 'locate', { accuracy: 'high' }, { silentOffline: true });
     const done = await this.d.awaitResult(res.id, 45_000);
     const loc = done.data?.location;
     if (!done.ok || !loc)
-      return void (await this.tg.send(chatId, `⚠️ Lokasi gagal: ${done.error || 'tidak ada data'}`));
+      return void (await this.tg.send(chatId, `âš ï¸ Lokasi gagal: ${done.error || 'tidak ada data'}`));
     await this.tg.sendLocation(chatId, loc.lat, loc.lng, {
-      caption: `📍 <b>${esc(d.nama_device)}</b>\n±${loc.accuracy ?? '?'}m · ${loc.source || 'fused'} · ${
+      caption: `ðŸ“ <b>${esc(d.nama_device)}</b>\nÂ±${loc.accuracy ?? '?'}m Â· ${loc.source || 'fused'} Â· ${
         done.data?.battery !== undefined ? `${done.data.battery}%` : ''
-      } · ${fmtTime(loc.ts)}`,
+      } Â· ${fmtTime(loc.ts)}`,
     });
     // Simpan juga ke riwayat supaya /riwayat_lokasi langsung punya data
     await locationsRepo.insert(d.device_id, { ...loc, source: loc.source || 'manual' });
@@ -495,19 +553,19 @@ export class TelegramBot {
     if (!d) return;
     const hours = Math.min(720, Math.max(1, Number(parts[1]) || 6));
     const rows = await locationsRepo.recent(d.device_id, hours, 300);
-    if (!rows.length) return void (await this.tg.send(chatId, `📭 Tidak ada titik lokasi dalam ${hours} jam terakhir.`));
+    if (!rows.length) return void (await this.tg.send(chatId, `ðŸ“­ Tidak ada titik lokasi dalam ${hours} jam terakhir.`));
     const first = rows[rows.length - 1];
     const last = rows[0];
     await this.tg.sendLocation(chatId, last.lat, last.lng, {
-      caption: `🧭 <b>${esc(d.nama_device)}</b> - ${hours} jam terakhir\n${rows.length} titik · ${
+      caption: `ðŸ§­ <b>${esc(d.nama_device)}</b> - ${hours} jam terakhir\n${rows.length} titik Â· ${
         last.ts
       }`,
     });
     const lines = ['<b>Riwayat (10 terakhir)</b>'];
     for (const r of rows.slice(0, 10)) {
       lines.push(
-        `${fmtTime(r.ts)} · ${r.lat.toFixed(5)}, ${r.lng.toFixed(5)} ±${r.accuracy ?? '?'}m${
-          r.breach ? ' ⚠️ luar geofence' : ''
+        `${fmtTime(r.ts)} Â· ${r.lat.toFixed(5)}, ${r.lng.toFixed(5)} Â±${r.accuracy ?? '?'}m${
+          r.breach ? ' âš ï¸ luar geofence' : ''
         }`,
       );
     }
@@ -519,19 +577,19 @@ export class TelegramBot {
     const d = await this.pickDevice(chatId, query, `camera_${kind}`);
     if (!d) return;
     if (!this.hub.isOnline(d.device_id))
-      return void (await this.tg.send(chatId, `⚫ ${esc(d.nama_device)} offline, kamera tidak bisa diakses.`));
-    const label = kind === 'front' ? '📷 kamera depan' : '📷 kamera belakang';
-    await this.tg.send(chatId, `⏳ Mengambil ${label} dari <b>${esc(d.nama_device)}</b>...`);
+      return void (await this.tg.send(chatId, `âš« ${esc(d.nama_device)} offline, kamera tidak bisa diakses.`));
+    const label = kind === 'front' ? 'ðŸ“· kamera depan' : 'ðŸ“· kamera belakang';
+    await this.tg.send(chatId, `â³ Mengambil ${label} dari <b>${esc(d.nama_device)}</b>...`);
     const res = await this.issue(chatId, d, `camera_${kind}`, {}, { silentOffline: true });
     const done = await this.d.awaitResult(res.id, 70_000);
     if (!done.ok || !done.data?.mediaId)
-      return void (await this.tg.send(chatId, `⚠️ Gagal ambil foto: ${done.error || 'tidak ada media'}`));
+      return void (await this.tg.send(chatId, `âš ï¸ Gagal ambil foto: ${done.error || 'tidak ada media'}`));
     const buf = await this.readMedia(done.data.mediaId);
-    if (!buf) return void (await this.tg.send(chatId, '⚠️ File foto tidak bisa didekripsi (key server berubah?).'));
+    if (!buf) return void (await this.tg.send(chatId, 'âš ï¸ File foto tidak bisa didekripsi (key server berubah?).'));
     const loc = done.data.location || (await devicesRepo.lastLocation(d.device_id));
-    const caption = `📷 <b>${esc(d.nama_device)}</b> · ${kind}${
-      loc ? `\n📍 ${loc.lat.toFixed(5)}, ${loc.lng.toFixed(5)}` : ''
-    }\n🕒 ${fmtTime(done.data.ts || new Date().toISOString())}`;
+    const caption = `ðŸ“· <b>${esc(d.nama_device)}</b> Â· ${kind}${
+      loc ? `\nðŸ“ ${loc.lat.toFixed(5)}, ${loc.lng.toFixed(5)}` : ''
+    }\nðŸ•’ ${fmtTime(done.data.ts || new Date().toISOString())}`;
     await this.tg
       .photo(chatId, buf, { caption })
       .catch(async (e) => {
@@ -556,7 +614,7 @@ export class TelegramBot {
     const d = await this.pickDevice(chatId, query, 'ring');
     if (!d) return;
     await this.issue(chatId, d, 'ring', { seconds: 20 });
-    await this.tg.send(chatId, `🔔 Alarm dibunyikan di <b>${esc(d.nama_device)}</b>.`);
+    await this.tg.send(chatId, `ðŸ”” Alarm dibunyikan di <b>${esc(d.nama_device)}</b>.`);
   }
 
   async cmdToast(chatId, query) {
@@ -565,7 +623,7 @@ export class TelegramBot {
     const d = await this.pickDevice(chatId, m[1], 'pesan');
     if (!d) return;
     await this.issue(chatId, d, 'toast', { text: m[2] });
-    await this.tg.send(chatId, `💬 Pesan dikirim ke <b>${esc(d.nama_device)}</b>.`);
+    await this.tg.send(chatId, `ðŸ’¬ Pesan dikirim ke <b>${esc(d.nama_device)}</b>.`);
   }
 
   async cmdMarkLost(chatId, query) {
@@ -583,7 +641,7 @@ export class TelegramBot {
     }
     await this.tg.send(
       chatId,
-      `🟥 <b>${esc(d.nama_device)}</b> ditandai HILANG.\n• status_sewa = hilang\n• auto-lock dikirim\n• pelacakan tiap 30 detik selama 6 jam\n\nUntuk normalkan: /tandai_tersedia ${esc(d.device_id)}`,
+      `ðŸŸ¥ <b>${esc(d.nama_device)}</b> ditandai HILANG.\nâ€¢ status_sewa = hilang\nâ€¢ auto-lock dikirim\nâ€¢ pelacakan tiap 30 detik selama 6 jam\n\nUntuk normalkan: /tandai_tersedia ${esc(d.device_id)}`,
     );
   }
 
@@ -593,7 +651,7 @@ export class TelegramBot {
     const d = await this.pickDevice(chatId, m[1], 'disewa');
     if (!d) return;
     await devicesRepo.update(d.device_id, { status_sewa: 'disewa', nama_penyewa: m[2].slice(0, 120) });
-    await this.tg.send(chatId, `🟧 <b>${esc(d.nama_device)}</b> -> disewa oleh <b>${esc(m[2])}</b>.`);
+    await this.tg.send(chatId, `ðŸŸ§ <b>${esc(d.nama_device)}</b> -> disewa oleh <b>${esc(m[2])}</b>.`);
   }
 
   async cmdMarkFree(chatId, query) {
@@ -601,14 +659,14 @@ export class TelegramBot {
     if (!d) return;
     await this.d.cancelPending(d.device_id, 'device ditandai tersedia').catch(() => {});
     await devicesRepo.update(d.device_id, { status_sewa: 'tersedia', nama_penyewa: null });
-    await this.tg.send(chatId, `🟦 <b>${esc(d.nama_device)}</b> -> tersedia, antrean command dibersihkan.`);
+    await this.tg.send(chatId, `ðŸŸ¦ <b>${esc(d.nama_device)}</b> -> tersedia, antrean command dibersihkan.`);
   }
 
   async cmdSetSewa(chatId, query, status) {
     const d = await this.pickDevice(chatId, query, status);
     if (!d) return;
     await devicesRepo.update(d.device_id, { status_sewa: status });
-    await this.tg.send(chatId, `🛠 <b>${esc(d.nama_device)}</b> -> ${status}.`);
+    await this.tg.send(chatId, `ðŸ›  <b>${esc(d.nama_device)}</b> -> ${status}.`);
   }
 
   async cmdRadius(chatId, query) {
@@ -626,8 +684,8 @@ export class TelegramBot {
     await this.tg.send(
       chatId,
       armed
-        ? `📍 Geofence <b>${esc(d.nama_device)}</b> = ${Math.round(meter)} m (titik acuan: lokasi sekarang).`
-        : `📍 Geofence <b>${esc(d.nama_device)}</b> dimatikan.`,
+        ? `ðŸ“ Geofence <b>${esc(d.nama_device)}</b> = ${Math.round(meter)} m (titik acuan: lokasi sekarang).`
+        : `ðŸ“ Geofence <b>${esc(d.nama_device)}</b> dimatikan.`,
     );
   }
 
@@ -640,14 +698,14 @@ export class TelegramBot {
       intervalSec: 30,
       untilSec: minutes * 60,
     });
-    await this.tg.send(chatId, `🛰 Lacak <b>${esc(d.nama_device)}</b> tiap 30 detik selama ${minutes} menit.`);
+    await this.tg.send(chatId, `ðŸ›° Lacak <b>${esc(d.nama_device)}</b> tiap 30 detik selama ${minutes} menit.`);
   }
 
   async cmdTrackStop(chatId, query) {
     const d = await this.pickDevice(chatId, query, 'stop_lacak');
     if (!d) return;
     await this.issue(chatId, d, 'track_stop', {});
-    await this.tg.send(chatId, `🛑 Pelacakan <b>${esc(d.nama_device)}</b> dihentikan.`);
+    await this.tg.send(chatId, `ðŸ›‘ Pelacakan <b>${esc(d.nama_device)}</b> dihentikan.`);
   }
 
   async cmdKiosk(chatId, query) {
@@ -656,7 +714,7 @@ export class TelegramBot {
     if (!d) return;
     const on = /on|1|ya|aktif/i.test(parts[1] || 'on');
     await this.issue(chatId, d, 'set_kiosk', { enabled: on });
-    await this.tg.send(chatId, `${on ? '📌' : '🔓'} Kiosk <b>${esc(d.nama_device)}</b> ${on ? 'AKTIF' : 'nonaktif'}.`);
+    await this.tg.send(chatId, `${on ? 'ðŸ“Œ' : 'ðŸ”“'} Kiosk <b>${esc(d.nama_device)}</b> ${on ? 'AKTIF' : 'nonaktif'}.`);
   }
 
   async cmdRename(chatId, query) {
@@ -667,17 +725,236 @@ export class TelegramBot {
     const newName = m[2].trim().slice(0, 120);
     const clash = await devicesRepo.byNameExact(newName);
     if (clash && clash.device_id !== d.device_id)
-      return void (await this.tg.send(chatId, `❌ Nama <code>${esc(newName)}</code> sudah dipakai ${esc(clash.device_id)}.`));
+      return void (await this.tg.send(chatId, `âŒ Nama <code>${esc(newName)}</code> sudah dipakai ${esc(clash.device_id)}.`));
     await devicesRepo.update(d.device_id, { nama_device: newName });
+    await auditRepo.write({
+      actor: `tg:${chatId}`,
+      action: 'device.rename',
+      target: d.device_id,
+      detail: { dari: d.nama_device, ke: newName },
+      ok: true,
+    });
     await this.issue(chatId, d, 'sync_config', {}, { silentOffline: true }).catch(() => {});
-    await this.tg.send(chatId, `✏️ <code>${esc(d.device_id)}</code> -&gt; <b>${esc(newName)}</b>.`);
+    await this.tg.send(chatId, `âœï¸ <code>${esc(d.device_id)}</code> -&gt; <b>${esc(newName)}</b>.`);
+  }
+
+  // ------------------------------------------------- manajemen admin (bot) --
+  /**
+   * /tambah_admin <username> <sandi_gerbang> <sandi_baru_untuk_staf>
+   *
+   * Membuat akun admin baru sekaligus menautkannya ke chat_id pengirim, supaya
+   * orang yang mendaftar langsung bisa memakai bot. Ini memudahkan pemilik
+   * menambah pekerja tanpa menyentuh terminal.
+   *
+   * Amannya:
+   *  - wajib tahu sandi gerbang (disimpan hanya sebagai hash scrypt)
+   *  - password akun baru di-hash scrypt, tidak pernah disimpan mentah
+   *  - pesan yang memuat sandi dihapus dari chat setelah diproses
+   *  - hanya superadmin (atau chat yang terdaftar di ADMIN_CHAT_IDS) yang boleh
+   *  - akun baru berperan 'staff' kecuali diminta eksplisit
+   */
+  async cmdTambahAdmin(chatId, query, msg) {
+    const parts = query.split(/\s+/).filter(Boolean);
+    const usage =
+      '<b>Format:</b> <code>/tambah_admin &lt;username&gt; &lt;sandi_gerbang&gt; &lt;sandi_baru&gt;</code>\n' +
+      'Contoh: <code>/tambah_admin budi SANDI_GERBANG_ANDA rahasia123</code>\n\n' +
+      'Sandi gerbang adalah sandi khusus pemilik untuk membuka fitur ini. ' +
+      'Pesan ini akan dihapus otomatis demi keamanan.';
+    if (parts.length < 3) return void (await this.tg.send(chatId, usage));
+
+    const [username, gatePw, newPw] = parts;
+    const me = await adminsRepo.byTelegramChatId(chatId);
+
+    // Gerbang: harus superadmin aktif. onMessage() sudah memastikan chat ini
+    // terdaftar; di sini kita naikkan syaratnya ke peran superadmin.
+    if (!(me && me.is_active && me.role === 'superadmin')) {
+      await auditRepo.write({
+        actor: `tg:${chatId}`,
+        action: 'admin.add.denied',
+        target: username,
+        ok: false,
+      });
+      return void (await this.tg.send(chatId, 'â›”ï¸ Hanya superadmin yang boleh menambah admin.'));
+    }
+
+    if (!/^[A-Za-z0-9_.-]{3,32}$/.test(username)) {
+      return void (await this.tg.send(chatId, 'âŒ Username 3-32 karakter, hanya huruf/angka/._-'));
+    }
+    if (newPw.length < 8) {
+      return void (await this.tg.send(chatId, 'âŒ Sandi baru minimal 8 karakter.'));
+    }
+    if (await adminsRepo.byUsername(username)) {
+      return void (await this.tg.send(chatId, `âŒ Username <code>${esc(username)}</code> sudah ada.`));
+    }
+
+    const gateHash = await this.resolveGateHash();
+    if (!gateHash) {
+      return void (
+        await this.tg.send(
+          chatId,
+          'âŒ Fitur ini belum diaktifkan.\n' +
+            'Pemilik server harus menyetel sandi gerbang dulu:\n' +
+            '<code>node scripts/admin.mjs set-gate SANDI_GERBANG_ANDA</code>',
+        )
+      );
+    }
+    if (!verifyPassword(gatePw, gateHash)) {
+      await auditRepo.write({
+        actor: `tg:${chatId}`,
+        action: 'admin.add.bad_gate',
+        target: username,
+        ok: false,
+      });
+      return void (await this.tg.send(chatId, 'âŒ Sandi gerbang salah.'));
+    }
+
+    // Akun dibuat TANPA ditautkan ke chat siapa pun. Pekerja menautkan
+    // Telegram-nya sendiri lewat /mulai. Kalau owner yang mengetik di sini,
+    // chat owner tidak boleh ikut tertaut ke akun pekerja.
+    const created = await adminsRepo.createWithChat({
+      username,
+      passwordHash: hashPassword(newPw),
+      role: 'staff',
+      telegramChatId: null,
+      telegramUsername: null,
+    });
+
+    await auditRepo.write({
+      actor: `tg:${chatId}`,
+      action: 'admin.add.ok',
+      target: username,
+      detail: { role: created.role },
+      ok: true,
+    });
+
+    // Hapus pesan yang memuat sandi agar tidak menetap di riwayat chat.
+    if (msg?.message_id) this.tg.deleteMsg(chatId, msg.message_id);
+
+    await this.tg.send(
+      chatId,
+      `âœ… Admin <b>${esc(username)}</b> dibuat (peran staff).\n` +
+        'Sandi login sudah di-hash scrypt â€” tidak bisa dibaca kembali oleh siapa pun.\n\n' +
+        `<b>Suruh pekerja membuka bot ini lalu kirim:</b>\n` +
+        `<code>/mulai ${esc(username)} &lt;sandi_yang_tadi&gt;</code>\n\n` +
+        'Chat pekerja akan otomatis tertaut ke akun itu. Satu chat hanya boleh satu akun.\n' +
+        'Ganti sandi kapan saja: <code>/ganti_sandi &lt;sandi_lama&gt; &lt;sandi_baru&gt;</code>',
+    );
+  }
+
+  /**
+   * /mulai <username> <sandi>
+   *
+   * Aktivasi mandiri untuk pekerja: menautkan chat Telegram pengirim ke akun
+   * admin yang sudah dibuat pemilik. Diterima walau chat belum di-whitelist.
+   *
+   * Aman karena:
+   *  - wajib tahu sandi akun (diverifikasi terhadap hash scrypt)
+   *  - akun harus aktif
+   *  - chat yang sudah tertaut akun lain tidak bisa membajak akun kedua
+   *  - sandi dihapus dari chat setelah diproses
+   */
+  async cmdAktivasi(chatId, query, msg) {
+    const parts = query.split(/\s+/).filter(Boolean);
+    if (parts.length < 2) {
+      return void (
+        await this.tg.send(chatId, '<b>Format:</b> <code>/mulai &lt;username&gt; &lt;sandi_anda&gt;</code>')
+      );
+    }
+    const [username, password] = parts;
+
+    // Jangan proses kalau lawan bicara bukan private chat: di grup, chat_id
+    // adalah grup, bukan orangnya.
+    if (msg?.chat?.type && msg.chat.type !== 'private') {
+      return void (await this.tg.send(chatId, 'Aktivasi hanya bisa lewat chat pribadi dengan bot.'));
+    }
+
+    const target = await adminsRepo.byUsername(username);
+    const ambil = () =>
+      this.tg
+        .send(
+          chatId,
+          'âŒ Username atau sandi salah, atau akun tidak aktif.\n' +
+            'Minta pemilik memeriksa akun Anda, lalu coba lagi.',
+        )
+        .catch(() => {});
+    if (!target || !target.is_active) {
+      await auditRepo.write({ actor: `tg:${chatId}`, action: 'admin.activate.denied', target: username, ok: false });
+      return void (await ambil());
+    }
+    if (!verifyPassword(password, target.password_hash)) {
+      await auditRepo.write({ actor: `tg:${chatId}`, action: 'admin.activate.bad_pass', target: username, ok: false });
+      return void (await ambil());
+    }
+
+    // Chat ini sudah tertaut akun aktif lain? Hentikan, jangan rebut.
+    const holder = await adminsRepo.byTelegramChatId(chatId);
+    if (holder && holder.is_active && holder.id !== target.id) {
+      return void (
+        await this.tg.send(
+          chatId,
+          `âŒ Chat Telegram ini sudah tertaut ke akun <code>${esc(holder.username)}</code>.\n` +
+            'Satu chat hanya boleh satu akun.',
+        )
+      );
+    }
+    // Akun yang sama tapi sudah dipakai chat lain? Jangan bajak.
+    if (target.telegram_chat_id && String(target.telegram_chat_id) !== String(chatId)) {
+      return void (
+        await this.tg.send(
+          chatId,
+          `âŒ Akun <code>${esc(username)}</code> sudah tertaut ke chat Telegram lain.\n` +
+            'Minta pemilik mencabut tautannya dulu.',
+        )
+      );
+    }
+
+    await adminsRepo.linkTelegram(target.id, chatId, msg?.from?.username || null);
+    this.allowed.add(Number(chatId));
+    await auditRepo.write({ actor: `tg:${chatId}`, action: 'admin.activate.ok', target: username, ok: true });
+
+    if (msg?.message_id) this.tg.deleteMsg(chatId, msg.message_id);
+    await this.tg.send(
+      chatId,
+      `âœ… Selamat datang, <b>${esc(username)}</b>! Chat ini sekarang tertaut ke akun Anda.\n` +
+        'Kirim <code>/help</code> untuk melihat semua perintah.\n' +
+        'Ganti sandi Anda: <code>/ganti_sandi &lt;sandi_lama&gt; &lt;sandi_baru&gt;</code>',
+    );
+  }
+
+  /**
+   * /ganti_sandi <sandi_lama> <sandi_baru>
+   * Setiap admin boleh mengganti sandi login-nya sendiri.
+   */
+  async cmdGantiSandi(chatId, query, msg) {
+    const parts = query.split(/\s+/).filter(Boolean);
+    if (parts.length < 2) {
+      return void (
+        await this.tg.send(chatId, '<b>Format:</b> <code>/ganti_sandi &lt;sandi_lama&gt; &lt;sandi_baru&gt;</code>')
+      );
+    }
+    const [oldPw, newPw] = parts;
+    const me = await adminsRepo.byTelegramChatId(chatId);
+    if (!me || !me.is_active) {
+      return void (await this.tg.send(chatId, 'â›”ï¸ Chat ini belum tertaut ke akun admin mana pun.'));
+    }
+    if (!verifyPassword(oldPw, me.password_hash)) {
+      await auditRepo.write({ actor: `tg:${chatId}`, action: 'admin.passwd.bad_old', target: me.username, ok: false });
+      return void (await this.tg.send(chatId, 'âŒ Sandi lama salah.'));
+    }
+    if (newPw.length < 8) {
+      return void (await this.tg.send(chatId, 'âŒ Sandi baru minimal 8 karakter.'));
+    }
+    await adminsRepo.setPassword(me.id, hashPassword(newPw));
+    await auditRepo.write({ actor: `tg:${chatId}`, action: 'admin.passwd.ok', target: me.username, ok: true });
+    if (msg?.message_id) this.tg.deleteMsg(chatId, msg.message_id);
+    await this.tg.send(chatId, `ðŸ”‘ Sandi login <b>${esc(me.username)}</b> berhasil diganti (hash scrypt diperbarui).`);
   }
 
   async askConfirm(chatId, query, action, label) {
     const d = await this.pickDevice(chatId, query, action);
     if (!d) return;
     this.sessions.set(chatId, { action, deviceId: d.device_id, at: Date.now() });
-    await this.tg.send(chatId, `⚠️ <b>${label}</b>\nDevice: <code>${esc(d.nama_device)}</code>`, {
+    await this.tg.send(chatId, `âš ï¸ <b>${label}</b>\nDevice: <code>${esc(d.nama_device)}</code>`, {
       reply_markup: kbYesNo(action, `${action}:yes`, `${action}:no`),
     });
   }
@@ -686,7 +963,7 @@ export class TelegramBot {
     const a = await adminsRepo.byTelegramChatId(chatId);
     const isEnvSuper = config.telegram.adminChatIds.includes(Number(chatId));
     if (!isEnvSuper && (!a || a.role !== 'superadmin'))
-      return void (await this.tg.send(chatId, '⛔️ Hanya superadmin yang bisa rotasi token.'));
+      return void (await this.tg.send(chatId, 'â›”ï¸ Hanya superadmin yang bisa rotasi token.'));
     const d = await this.pickDevice(chatId, query, 'rotasi');
     if (!d) return;
     const { token, pairCode } = await devicesRepo.rotateToken(d.device_id);
@@ -698,7 +975,7 @@ export class TelegramBot {
     });
     await this.tg.send(
       chatId,
-      `🔁 Token <b>${esc(d.nama_device)}</b> dirotasi.\nKode pairing baru (beri ke staff, sekali pakai): <code>${esc(pairCode)}</code>\nDevice dengan token lama akan ditolak sampai pairing ulang.`,
+      `ðŸ” Token <b>${esc(d.nama_device)}</b> dirotasi.\nKode pairing baru (beri ke staff, sekali pakai): <code>${esc(pairCode)}</code>\nDevice dengan token lama akan ditolak sampai pairing ulang.`,
     );
     log.info('token dirotasi', { deviceId: d.device_id, pairCodePreview: `${pairCode.slice(0, 2)}***` });
   }
@@ -709,7 +986,7 @@ export class TelegramBot {
     const lines = ['<b>AUDIT TERAKHIR</b>'];
     for (const r of rows) {
       lines.push(
-        `${r.created_at.slice(11, 19)} ${r.ok ? '✅' : '⛔️'} <code>${esc(r.action)}</code> ${
+        `${r.created_at.slice(11, 19)} ${r.ok ? 'âœ…' : 'â›”ï¸'} <code>${esc(r.action)}</code> ${
           r.target ? esc(r.target) : ''
         } <i>${esc(r.actor)}</i>`,
       );
@@ -725,7 +1002,7 @@ export class TelegramBot {
       '<b>STATISTIK SERVER</b>',
       `Total device : ${stat.total}`,
       `Online       : ${stat.online}`,
-      `Tersedia ${stat.tersedia} · Sewa ${stat.disewa} · Hilang ${stat.hilang} · Maintenance ${stat.maintenance}`,
+      `Tersedia ${stat.tersedia} Â· Sewa ${stat.disewa} Â· Hilang ${stat.hilang} Â· Maintenance ${stat.maintenance}`,
       `Sesi WS      : ${hub.sessions}`,
       `Server       : ${config.serverName}`,
       '',
@@ -748,7 +1025,7 @@ export class TelegramBot {
     await this.tg.send(
       chatId,
       `<b>UJI SISTEM</b>\n${checks
-        .map(([n, v]) => `${v ? '✅' : '❌'} ${n}`)
+        .map(([n, v]) => `${v ? 'âœ…' : 'âŒ'} ${n}`)
         .join('\n')}\n${ok ? 'Semua komponen hidup.' : 'Ada komponen bermasalah.'}`,
     );
   }
@@ -757,7 +1034,7 @@ export class TelegramBot {
     const rows = listCatalog();
     return [
       '<b>DAFTAR COMMAND TERSEDIA</b>',
-      ...rows.map((r) => `${r.destructive ? '⚠️' : '•'} <code>${r.type}</code> — ${r.describe}`),
+      ...rows.map((r) => `${r.destructive ? 'âš ï¸' : 'â€¢'} <code>${r.type}</code> â€” ${r.describe}`),
     ].join('\n');
   }
 
@@ -819,7 +1096,7 @@ export class TelegramBot {
         if (rest[0] === 'no') {
           this.sessions.delete(chatId);
           await this.tg.answerCb(cb.id, 'Dibatalkan');
-          await this.tg.edit(chatId, cb.message.message_id, '❌ Dibatalkan.').catch(() => {});
+          await this.tg.edit(chatId, cb.message.message_id, 'âŒ Dibatalkan.').catch(() => {});
           return;
         }
         if (rest[0] !== 'yes') return void (await this.tg.answerCb(cb.id, 'Klik Ya dulu', true));
@@ -829,7 +1106,7 @@ export class TelegramBot {
         const d = await devicesRepo.byId(s.deviceId);
         this.sessions.delete(chatId);
         await this.tg.answerCb(cb.id, 'Dikerjakan');
-        await this.tg.edit(chatId, cb.message.message_id, `⚙️ <code>${cmd}</code> dikirim ke ${esc(d?.nama_device || '-')}`);
+        await this.tg.edit(chatId, cb.message.message_id, `âš™ï¸ <code>${cmd}</code> dikirim ke ${esc(d?.nama_device || '-')}`);
         if (cmd === 'wipe') await auditRepo.write({ actor: `bot:${chatId}`, action: 'device.wipe', target: s.deviceId });
         return void (await this.issue(chatId, d, cmd, {}));
       }
@@ -910,7 +1187,7 @@ export class TelegramBot {
     bus.on('alert', async (a) => {
       const targets = new Set(this.allowed);
       if (config.telegram.alertGroupChatId) targets.add(config.telegram.alertGroupChatId);
-      const icon = a.level === 'critical' ? '🟥' : '🟧';
+      const icon = a.level === 'critical' ? 'ðŸŸ¥' : 'ðŸŸ§';
       for (const t of targets) {
         await this.tg
           .send(t, `${icon} <b>ALERT</b>\n${esc(a.text)}`, { reply_markup: kbDevice({ device_id: a.deviceId }, a.deviceId) })

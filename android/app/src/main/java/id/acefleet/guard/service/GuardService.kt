@@ -8,6 +8,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
@@ -329,6 +330,12 @@ class GuardService : Service() {
      */
     private fun startLocationLoop() {
         scope.launch {
+            // Titik pertama dikirim LANGSUNG, tidak setelah menunggu satu
+            // interval penuh. Kalau tidak, unit yang baru dipasang terlihat
+            // "online tapi tanpa lokasi" selama 5 menit, dan unit yang sudah
+            // terkunci selama 60 detik - terlalu lama untuk operasi yang sedang
+            // dikejar.
+            var first = true
             while (isActive) {
                 val tracking = trackingIntervalSec > 0 && System.currentTimeMillis() < trackingUntil
                 val interval = when {
@@ -336,7 +343,8 @@ class GuardService : Service() {
                     cfg.policyState.isLocked -> 60L
                     else -> 300L
                 }
-                delay(interval * 1000L)
+                if (!first) delay(interval * 1000L)
+                first = false
                 if (!cfg.isEnrolled) continue
                 val loc = locations.current(highAccuracy = tracking || cfg.policyState.isLocked)
                     ?: locations.lastKnown()
@@ -416,13 +424,25 @@ class GuardService : Service() {
     private fun promoteToForeground(text: String) {
         val notif = Watchdog.notification(this, text)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIF_ID,
-                notif,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
-            )
+            // Android 14+ (API 34) melempar SecurityException kalau FGS naik
+            // dengan tipe LOCATION sementara permission lokasi belum di-grant
+            // saat runtime. Guard lalu ikut mati setiap kali naik ke foreground.
+            // Jadi tipe LOCATION hanya ikut kalau izinnya benar-benar ada.
+            //
+            // Kenapa izinnya bisa belum ada: setPermissionGrantState hanya
+            // berhasil kalau app sudah Device Owner. Unit yang belum jadi
+            // Device Owner (mis. masih ada akun Google di HP) harus lewat
+            // dialog izin biasa dulu.
+            var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            val fine = checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) ==
+                PackageManager.PERMISSION_GRANTED
+            val coarse = checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION) ==
+                PackageManager.PERMISSION_GRANTED
+            if (fine || coarse) {
+                type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            }
+            startForeground(NOTIF_ID, notif, type)
         } else {
             startForeground(NOTIF_ID, notif)
         }

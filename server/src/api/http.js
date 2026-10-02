@@ -189,11 +189,24 @@ async function route(ctx) {
       target: out.deviceId,
       ip,
     });
+    const wsUrl = `${config.publicBaseUrl.replace(/^http/, 'ws')}/ws/v1/device`;
+    // Guard di HP memakai wsUrl ini apa adanya. Kalau PUBLIC_BASE_URL
+    // menunjuk localhost/127.0.0.1, setiap HP akan disuruh konek ke dirinya
+    // sendiri dan tidak akan pernah online - tanpa error yang mencolok,
+    // karena device akan diam-diam retry. Tolak lebih awal di sini.
+    if (/^(https?|wss?):\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/i.test(config.publicBaseUrl)) {
+      return send(res, 500, {
+        error:
+          'PUBLIC_BASE_URL masih localhost. Device akan disuruh konek ke dirinya ' +
+          'sendiri dan tidak akan pernah online. Isi dengan IP LAN atau domain ' +
+          'yang bisa dijangkau unit, contoh http://192.168.1.10:8787',
+      });
+    }
     return send(res, 200, {
       deviceId: out.deviceId,
       nama: out.nama,
       token: out.token,
-      wsUrl: `${config.publicBaseUrl.replace(/^http/, 'ws')}/ws/v1/device`,
+      wsUrl,
       protocol: 'fleetguard.v1',
       heartbeatIntervalMs: config.runtime.heartbeatIntervalMs,
     });

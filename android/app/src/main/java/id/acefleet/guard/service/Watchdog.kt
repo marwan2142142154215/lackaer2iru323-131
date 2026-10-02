@@ -42,6 +42,10 @@ class Watchdog(
     private lateinit var handler: Handler
     private var lastAppliedState: PolicyState? = null
     private var lastCameraOff: Boolean? = null
+
+    /** Drift terakhir yang sudah dilaporkan; dipakai supaya laporan hanya
+     *  terjadi saat kondisinya berubah, bukan setiap siklus 500 ms. */
+    private var reportedDrift: Drift? = null
     @Volatile var socketAlive = false
         private set
     @Volatile var lastFrameAt = 0L
@@ -84,9 +88,18 @@ class Watchdog(
 
     private fun check() {
         // 1. masih device owner?
+        //
+        // Penting: drift dilaporkan HANYA saat kondisinya berubah. Sebelumnya
+        // setiap siklus 500 ms melaporkan ulang, jadi satu unit yang memang
+        // belum di-provisioning (belum Device Owner) mengirim event
+        // "tamper/critical" 2x per detik tanpa henti. Itu membanjiri server
+        // dan, lebih buruk, menutupi alarm tamper yang sungguhan.
         if (!id.acefleet.guard.GuardDeviceAdminReceiver.isDeviceOwner(ctx)) {
-            Logs.w(TAG, "DRIFT: Guard bukan device owner lagi")
-            onDrift(Drift.NOT_DEVICE_OWNER)
+            report(Drift.NOT_DEVICE_OWNER, "DRIFT: Guard bukan device owner lagi")
+            // Kebijakan tidak bisa ditegakkan tanpa Device Owner, tapi
+            // kesehatan socket dan wake lock TIDAK butuh Device Owner.
+            // Kalau dilewati juga, unit non-DO kehilangan watchdog sama sekali.
+            checkSocketAndAwake()
             return
         }
 
@@ -99,8 +112,7 @@ class Watchdog(
             val blocked = dpm?.getUserRestrictions(admin)
                 ?.getBoolean(android.os.UserManager.DISALLOW_FACTORY_RESET, false) == true
             if (!blocked) {
-                Logs.w(TAG, "DRIFT: factory reset tidak diblokir")
-                onDrift(Drift.FACTORY_RESET_ALLOWED)
+                report(Drift.FACTORY_RESET_ALLOWED, "DRIFT: factory reset tidak diblokir")
                 engine.applyBaseRestrictions()
             }
         }
@@ -116,8 +128,7 @@ class Watchdog(
         // 4. kamera harus mati saat terkunci
         if (cfg.policyState.isLocked && lastCameraOff == false) {
             runCatching { engine.apply(cfg.policyState, cfg.kioskEnabled) }
-            Logs.w(TAG, "DRIFT: kamera menyala saat terkunci")
-            onDrift(Drift.CAMERA_ON_WHILE_LOCKED)
+            report(Drift.CAMERA_ON_WHILE_LOCKED, "DRIFT: kamera menyala saat terkunci")
         }
         lastCameraOff = try {
             val dpm = ctx.getSystemService(android.app.admin.DevicePolicyManager::class.java)
@@ -130,16 +141,32 @@ class Watchdog(
             true
         }
 
-        // 5. socket hidup?
+        // 5. socket hidup? + 6. wormhole: kalau proses ini hilang, pastikan hidup lagi.
+        checkSocketAndAwake()
+        // Semua pemeriksaan lolos tanpa drift ->conditions siap dideteksi lagi.
+        reportedDrift = null
+    }
+
+    /**
+     * Cek kesehatan socket + pegang wakelock. Dipisah karena dua bagian ini
+     * tidak butuh Device Owner, jadi tetap jalan di unit yang belum
+     * di-provisioning.
+     */
+    private fun checkSocketAndAwake() {
         val maxAge = (cfg.heartbeatMs.toLong() * 3).coerceAtLeast(30_000L)
         if (socketAlive && SystemClock.elapsedRealtime() - lastFrameAt > maxAge) {
-            Logs.w(TAG, "socket tidak ada frame selama ${maxAge / 1000}s")
             socketAlive = false
-            onDrift(Drift.POLICY_MISMATCH) // sinyal untuk me-restart socket
+            report(Drift.POLICY_MISMATCH, "socket tidak ada frame selama ${maxAge / 1000}s")
         }
-
-        // 6. wormhole: kalau proses ini hilang, pastikan hidup lagi.
         if (socketAlive) keepAwake()
+    }
+
+    /** Laporkan drift hanya saat berganti kondisi, bukan tiap siklus. */
+    private fun report(drift: Drift, msg: String) {
+        if (reportedDrift == drift) return
+        reportedDrift = drift
+        Logs.w(TAG, msg)
+        onDrift(drift)
     }
 
     private fun keepAwake() {

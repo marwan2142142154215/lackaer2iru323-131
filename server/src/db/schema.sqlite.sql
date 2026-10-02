@@ -200,3 +200,15 @@ CREATE TABLE IF NOT EXISTS device_events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_dev ON device_events (device_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_sev ON device_events (severity, created_at DESC);
+
+-- ------------------------------------------------------------ app_settings --
+-- Pengaturan runtime yang jarang berubah, termasuk rahasia seperti password
+-- gerbang untuk menambah admin dari bot.
+--
+-- Yang disimpan SELALU hash scrypt (kolom value tidak pernah memuat password
+-- mentah). Bandingkan dengan hashPassword()/verifyPassword() di crypto/box.js.
+CREATE TABLE IF NOT EXISTS app_settings (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);

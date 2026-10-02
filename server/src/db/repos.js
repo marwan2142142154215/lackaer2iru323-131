@@ -558,6 +558,64 @@ export const adminsRepo = {
     );
     return this.byId(r.lastId);
   },
+
+  /**
+   * Membuat admin baru sekaligus menautkan chat_id Telegram-nya.
+   *
+   * Dibuat terpisah dari create() supaya pembuatan akun dan pemberian akses
+   * bot tidak bisa setengah jalan: kalau akun dibuat tapi chat_id gagal
+   * ditautkan, admin itu tidak bisa dipakai sama sekali dan sulit dilacak.
+   */
+  async createWithChat({ username, passwordHash, role = 'staff', telegramChatId, telegramUsername = null }) {
+    const now = nowIso();
+    const r = await D().run(
+      `INSERT INTO admin_users (username, password_hash, role, telegram_chat_id, telegram_username, is_active, created_at, updated_at)
+       VALUES (?,?,?,?,?,1,?,?)`,
+      [
+        username,
+        passwordHash,
+        role,
+        telegramChatId == null ? null : String(telegramChatId),
+        telegramUsername,
+        now,
+        now,
+      ],
+    );
+    return this.byId(r.lastId);
+  },
+
+  /** Ganti hash password admin (dipakai /ganti_sandi di bot). */
+  async setPassword(id, passwordHash) {
+    await D().run(
+      'UPDATE admin_users SET password_hash = ?, updated_at = ?, failed_logins = 0, locked_until = NULL WHERE id = ?',
+      [passwordHash, nowIso(), id],
+    );
+  },
+
+  /** Jumlah superadmin aktif; dipakai untuk mencegah terkunci di luar sistem. */
+  async countActiveSuperadmins() {
+    const row = await D().get(
+      "SELECT COUNT(*) AS c FROM admin_users WHERE role = 'superadmin' AND is_active = 1",
+    );
+    return Number(row?.c || 0);
+  },
+
+  /** Nonaktifkan admin (soft delete). Akun tidak dihapus agar jejak audit tetap. */
+  async deactivate(username) {
+    const r = await D().run(
+      'UPDATE admin_users SET is_active = 0, telegram_chat_id = NULL, updated_at = ? WHERE username = ?',
+      [nowIso(), username],
+    );
+    return r.changes;
+  },
+
+  /** Tautkan (atau lepas) chat Telegram ke akun admin. */
+  async linkTelegram(id, telegramChatId, telegramUsername = null) {
+    await D().run(
+      'UPDATE admin_users SET telegram_chat_id = ?, telegram_username = ?, updated_at = ? WHERE id = ?',
+      [telegramChatId == null ? null : String(telegramChatId), telegramUsername, nowIso(), id],
+    );
+  },
   async touchLogin(id, ip) {
     await D().run(
       "UPDATE admin_users SET last_login_at = ?, last_login_ip = ?, failed_logins = 0, locked_until = NULL WHERE id = ?",
@@ -574,6 +632,29 @@ export const adminsRepo = {
       lockedUntil,
       a.id,
     ]);
+  },
+};
+
+/**
+ * Pengaturan runtime (key-value), termasuk rahasia.
+ *
+ * Raison d'être: password gerbang tambah-admin harus bisa dikonfigurasi
+ * tanpa menyimpan plaintext dan tanpa menaruhnya di .env (yang lebih mudah
+ * tercecer lewat screenshot/log). Nilai disimpan sebagai hash scrypt.
+ */
+export const settingsRepo = {
+  async get(key) {
+    const r = await D().get('SELECT value FROM app_settings WHERE key = ?', [key]);
+    return r ? r.value : null;
+  },
+  async set(key, value) {
+    const now = nowIso();
+    // UPSERT portable untuk SQLite maupun Postgres.
+    await D().run('DELETE FROM app_settings WHERE key = ?', [key]);
+    await D().run('INSERT INTO app_settings (key, value, updated_at) VALUES (?,?,?)', [key, value, now]);
+  },
+  async has(key) {
+    return (await this.get(key)) != null;
   },
 };
 

@@ -180,3 +180,12 @@ CREATE TABLE IF NOT EXISTS device_events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_dev ON device_events (device_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_sev ON device_events (severity, created_at DESC);
+
+-- ------------------------------------------------------------ app_settings --
+-- Lihat schema.sqlite.sql untuk penjelasan. value selalu berisi hash scrypt
+-- untuk rahasia, bukan password mentah.
+CREATE TABLE IF NOT EXISTS app_settings (
+  key        VARCHAR(64) PRIMARY KEY,
+  value      TEXT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);

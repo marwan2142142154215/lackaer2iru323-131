@@ -40,7 +40,8 @@ const fakeTg = {
   async answerCb() {
     return {};
   },
-  async deleteMsg() {
+  async deleteMsg(chat, id) {
+    fakeTg.deleted.push({ chat, id });
     return {};
   },
   async getMe() {
@@ -53,6 +54,7 @@ const fakeTg = {
     return [];
   },
   async sleep() {},
+  deleted: [],
   esc: (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'),
 };
 
@@ -61,10 +63,10 @@ let fail = 0;
 const ok = (n, c, x = '') => {
   if (c) {
     pass++;
-    console.log(`  ✅ ${n}${x ? ` — ${x}` : ''}`);
+    console.log(`  âœ… ${n}${x ? ` â€” ${x}` : ''}`);
   } else {
     fail++;
-    console.log(`  ❌ ${n}${x ? ` — ${x}` : ''}`);
+    console.log(`  âŒ ${n}${x ? ` â€” ${x}` : ''}`);
   }
 };
 const last = () => outbox[outbox.length - 1];
@@ -83,11 +85,21 @@ const dispatcher = new CommandDispatcher();
 const hub = new DeviceHub(dispatcher);
 // Hub tidak di-attach ke HTTP server; tandai device online manual agar
 // bot tidak thinks device offline.
-const devices = await devicesRepo.all();
+const allDevices = await devicesRepo.all();
+// PENTING: uji ini me-RENAME device. Jangan pernah menyentuh device
+// produksi. Hanya device uji (seed-test-devices) yang boleh dipakai.
+const devices = allDevices.filter(
+  (d) => /^HP-0\d+$/.test(d.device_id) || String(d.nama_device).startsWith('UJI-'),
+);
 if (devices.length < 2) {
-  console.error('Butuh minimal 2 device untuk uji ini. Jalankan: npm run onboard -- batch --count 3 --group UJI');
+  console.error(
+    `Butuh minimal 2 device UJI (HP-001..), bukan device produksi.\n` +
+      `Ditemukan ${allDevices.length} device, ${devices.length} di antaranya device uji.\n` +
+      `Jalankan dulu: node scripts/seed-test-devices.mjs`,
+  );
   process.exit(1);
 }
+console.log(`  memakai ${devices.length} device uji: ${devices.map((d) => d.device_id).join(', ')}`);
 for (const d of devices) hub.sessions.set(d.device_id, { ws: { readyState: 1 }, ip: 'test', alive: true });
 
 const bot = new TelegramBot({ dispatcher, hub, notifier: fakeTg });
@@ -186,6 +198,121 @@ ok('/rename tolak nama bentrok', /sudah dipakai/.test(last().text));
 // 14. command catalog --------------------------------------------------------
 await bot.onMessage(msg('/perintah'));
 ok('/perintah daftar catalog', /camera_rear/.test(last().text) && /wipe/.test(last().text));
+
+// 15. rename valid (nama baru boleh ber-spasi) -------------------------------
+{
+  const before = target.nama_device;
+  const newName = 'Marwan Punya';
+  await bot.onMessage(msg(`/rename ${before} ${newName}`));
+  ok('/rename terima nama ber-spasi', new RegExp(newName).test(last().text), last().text.slice(0, 60));
+  const after = await devicesRepo.byId(target.device_id);
+  ok('/rename tersimpan di DB', after?.nama_device === newName, after?.nama_device);
+  // kembalikan supaya uji lain tidak terpengaruh
+  await devicesRepo.update(target.device_id, { nama_device: before });
+}
+
+// 16. tambah admin: gerbang + hashing ---------------------------------------
+{
+  const { hashPassword: hp, verifyPassword: vp } = await import('../src/crypto/box.js');
+  const { settingsRepo: sr, db } = await import('../src/db/repos.js').then(async (m) => ({
+    settingsRepo: m.settingsRepo,
+    db: (await import('../src/db/index.js')).db,
+  }));
+  await sr.set('smb.gate', hp('SANDI_GERBANG_ANDA'));
+
+  // Bersihkan sisa akun uji dari run sebelumnya (kalau ada) supaya uji ini
+  // idempotent - deactivate() hanya menonaktifkan, username tetap terpakai.
+  await db().run('DELETE FROM admin_users WHERE username = ?', ['stafbaru']);
+
+  // onMessage() memverifikasi via adminsRepo.byTelegramChatId(chatId). CHAT
+  // harus tertaut ke akun superadmin agar lolos gerbang whitelist.
+  const ADMIN_ID = 1; // admin 'andi' yang sudah superadmin
+  // SIMPAN nilai asli - jangan sampai uji ini mencabut tautan Telegram owner.
+  const adminRow = await adminsRepo.byId(ADMIN_ID);
+  const savedChat = adminRow.telegram_chat_id;
+  const savedRole = adminRow.role;
+  const savedActive = adminRow.is_active;
+  await db().run('UPDATE admin_users SET telegram_chat_id = ?, is_active = 1, role = ? WHERE id = ?', [
+    String(CHAT),
+    'superadmin',
+    ADMIN_ID,
+  ]);
+  bot.allowed.add(CHAT);
+  bot.allowed.delete(777_777);
+
+  // 16a. sandi gerbang salah -> ditolak
+  let n = outbox.length;
+  await bot.onMessage(msg('/tambah_admin stafuji salahbanget rahasia123'));
+  ok('/tambah_admin tolak gerbang salah', /gerbang salah/.test(outbox[n]?.text || ''), outbox[n]?.text?.slice(0, 40));
+
+  // 16b. username tidak valid -> ditolak
+  n = outbox.length;
+  await bot.onMessage(msg('/tambah_admin ab SANDI_GERBANG_ANDA rahasia123'));
+  ok('/tambah_admin tolak username pendek', /Username 3-32/.test(outbox[n]?.text || ''));
+
+  // 16c. sandi baru terlalu pendek -> ditolak
+  n = outbox.length;
+  await bot.onMessage(msg('/tambah_admin stafok SANDI_GERBANG_ANDA 123'));
+  ok('/tambah_admin tolak sandi pendek', /minimal 8 karakter/.test(outbox[n]?.text || ''));
+
+  // 16d. jalur sukses: /tambah_admin TIDAK menautkan chat pemanggil
+  n = outbox.length;
+  await bot.onMessage(msg('/tambah_admin stafbaru SANDI_GERBANG_ANDA sandirahasia9'));
+  ok('/tambah_admin berhasil', /Admin <b>stafbaru<\/b> dibuat/.test(outbox[n]?.text || ''), outbox[n]?.text?.slice(0, 50));
+
+  const created = await adminsRepo.byUsername('stafbaru');
+  ok('/tambah_admin akun tersimpan', !!created, created?.username);
+  ok('/tambah_admin peran staff', created?.role === 'staff', created?.role);
+  ok('/tambah_admin chat pemanggil TIDAK tertaut', created?.telegram_chat_id == null, String(created?.telegram_chat_id));
+  ok('/tambah_admin sandi ter-hash scrypt', String(created?.password_hash || '').startsWith('scrypt$'));
+  ok('/tambah_admin sandi tidak tersimpan mentah', !String(created?.password_hash || '').includes('sandirahasia9'));
+  ok('/tambah_admin sandi bisa diverifikasi', vp('sandirahasia9', created.password_hash));
+  ok('/tambah_admin pesan sandi dihapus', fakeTg.deleted.length > 0, `deleted=${fakeTg.deleted.length}`);
+
+  // 16e. /mulai - pekerja menautkan Telegram-nya sendiri
+  const WORKER = 555_444_333;
+  const workerMsg = (text) => ({
+    message_id: outbox.length + 1,
+    chat: { id: WORKER, type: 'private' },
+    from: { id: 7, username: 'pekerja1' },
+    text,
+  });
+
+  n = outbox.length;
+  await bot.onMessage(workerMsg('/mulai stafbaru sandisalahsekali'));
+  ok('/mulai tolak sandi salah', /Username atau sandi salah/.test(outbox[n]?.text || ''), outbox[n]?.text?.slice(0, 40));
+
+  bot.allowed.delete(WORKER); // pastikan aktivasi yang mengaktifkan, bukan pra-whitelist
+  n = outbox.length;
+  await bot.onMessage(workerMsg('/mulai stafbaru sandirahasia9'));
+  ok('/mulai berhasil', /tertaut ke akun Anda/.test(outbox[n]?.text || ''), outbox[n]?.text?.slice(0, 50));
+
+  const afterLink = await adminsRepo.byUsername('stafbaru');
+  ok('/mulai chat pekerja tertaut', String(afterLink?.telegram_chat_id) === String(WORKER), afterLink?.telegram_chat_id);
+  ok('/mulai chat pekerja masuk whitelist', await bot.isAllowed(WORKER));
+
+  // 16f. /ganti_sandi oleh pekerja
+  n = outbox.length;
+  await bot.onMessage(workerMsg('/ganti_sandi sandirahasia9 sandibaru2026'));
+  ok('/ganti_sandi berhasil', /berhasil diganti/.test(outbox[n]?.text || ''), outbox[n]?.text?.slice(0, 50));
+  const again = await adminsRepo.byUsername('stafbaru');
+  ok('/ganti_sandi hash diperbarui', vp('sandibaru2026', again.password_hash));
+
+  // 16g. akun non-superadmin tidak boleh menambah admin
+  bot.allowed.add(WORKER);
+  n = outbox.length;
+  await bot.onMessage(workerMsg('/tambah_admin stafketiga SANDI_GERBANG_ANDA rahasia123'));
+  ok('/tambah_admin tolak non-superadmin', /Hanya superadmin/.test(outbox[n]?.text || ''), outbox[n]?.text?.slice(0, 40));
+
+  // bersihkan akun uji, PULIHKAN keadaan owner semula
+  await adminsRepo.deactivate('stafbaru');
+  await db().run('DELETE FROM admin_users WHERE username = ?', ['stafbaru']);
+  bot.allowed.delete(WORKER);
+  await db().run(
+    'UPDATE admin_users SET telegram_chat_id = ?, role = ?, is_active = ? WHERE id = ?',
+    [savedChat, savedRole, savedActive, ADMIN_ID],
+  );
+}
 
 console.log(`\nHASIL: ${pass} lulus, ${fail} gagal\n`);
 process.exit(fail ? 1 : 0);

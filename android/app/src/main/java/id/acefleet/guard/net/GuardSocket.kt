@@ -1,6 +1,7 @@
 package id.acefleet.guard.net
 
 import android.util.Base64
+import id.acefleet.guard.BuildConfig
 import id.acefleet.guard.Logs
 import org.json.JSONObject
 import java.io.BufferedInputStream
@@ -8,6 +9,7 @@ import java.io.BufferedReader
 import java.io.InputStream
 import java.io.InputStreamReader
 import java.io.OutputStream
+import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.URI
 import java.security.MessageDigest
@@ -114,15 +116,24 @@ class GuardSocket(
 
     private fun connectAndRead() {
         val u = URI(url)
-        check(u.scheme.equals("wss", ignoreCase = true)) {
+        val isWss = u.scheme.equals("wss", ignoreCase = true)
+        val isInsecureWs = BuildConfig.DEBUG && u.scheme.equals("ws", ignoreCase = true)
+        // Build release: WSS saja. Cleartext hanya untuk build debug supaya bisa
+        // diuji ke server broker di PC lokal yang tidak punya TLS.
+        check(isWss || isInsecureWs) {
             "hanya wss:// yang diizinkan (dapat ${u.scheme})"
         }
-        val port = if (u.port > 0) u.port else 443
+        val port = if (u.port > 0) u.port else if (isWss) 443 else 80
 
-        val s = SSLSocketFactoryHolder.create(u.host, port)
+        val s: Socket = if (isWss) {
+            SSLSocketFactoryHolder.create(u.host, port)
+        } else {
+            // Hanya build debug. Server broker lokal tanpa TLS.
+            Socket().apply { connect(InetSocketAddress(u.host, port), 10_000) }
+        }
         s.tcpNoDelay = true
         s.soTimeout = 0 // read blocking; keepalive ditangani server lewat ping
-        s.startHandshake()
+        if (s is SSLSocket) s.startHandshake()
         sock = s
         out = s.getOutputStream()
         val raw = BufferedInputStream(s.getInputStream(), 32 * 1024)
@@ -151,26 +162,56 @@ class GuardSocket(
         out?.write(req.toByteArray(Charsets.US_ASCII))
         out?.flush()
 
-        // Header HTTP dibaca lewat reader terpisah; setelah baris kosong
-        // server belum mengirim frame apa pun, jadi tidak ada byte yang hilang.
-        val reader = BufferedReader(InputStreamReader(raw, Charsets.US_ASCII))
-        val status = reader.readLine() ?: error("tidak ada respons handshake")
-        check(status.contains(" 101")) { "upgrade ditolak: $status" }
+        // Header HTTP dibaca byte-per-byte LANGSUNG dari socket, bukan lewat
+        // BufferedReader. Reader punya buffer 8 KB dan akan ikut menelan frame
+        // WebSocket yang kebetulan tiba di segmen TCP yang sama dengan respons
+        // 101. Frame yang termakan tidak akan pernah terlihat readLoop, jadi
+        // Guard diam saja tanpa error yang mencolok. Server ini memang
+        // mengirim challenge segera setelah 101, jadi risikonya nyata.
+        var status = ""
+        val line = StringBuilder()
         while (true) {
-            val line = reader.readLine() ?: break
-            if (line.isEmpty()) break
+            val c = raw.read()
+            if (c < 0) error("tidak ada respons handshake")
+            val ch = c.toChar()
+            if (ch == '\n') {
+                val l = line.toString().trimEnd('\r')
+                if (status.isEmpty()) {
+                    status = l
+                } else if (l.isEmpty()) {
+                    break
+                }
+                line.setLength(0)
+            } else {
+                line.append(ch)
+            }
         }
+        check(status.contains(" 101")) { "upgrade ditolak: $status" }
     }
 
     private fun readLoop(raw: InputStream) {
+        // Penampung untuk frame yang ter-fragmentasi. Tanpa ini, frame
+        // opcode CONTINUATION akan dibuang diam-diam dan pesannya hilang.
+        val frag = java.io.ByteArrayOutputStream()
+        var fragOpcode = 0
+
         while (running) {
             val b0 = raw.read()
             if (b0 < 0) error("socket ditutup server")
+            val fin = (b0 and 0x80) != 0
             val opcode = b0 and 0x0F
-            val masked = (b0 and 0x80) != 0
-            var len = raw.read()
-            if (len < 0) error("stream terputus")
-            len = len and 0xFF
+            val b1 = raw.read()
+            if (b1 < 0) error("stream terputus")
+
+            // Bit MASK ada di byte KEDUA. Byte pertama bit 0x80-nya adalah
+            // FLAG FIN. Membacanya dari byte pertama membuat Guard menganggap
+            // setiap frame server ter-mask (karena FIN selalu 1), sehingga
+            // 4 byte pertama payload dimakan sebagai kunci mask dan readFully
+            // lalu menggantung menunggu byte yang tak pernah datang. Akibatnya
+            // challenge tidak pernah terbaca, auth tidak pernah terkirim, dan
+            // server menutup koneksi setelah auth timeout.
+            val masked = (b1 and 0x80) != 0
+            var len = b1 and 0x7F
             if (len == 126) {
                 val a = raw.read()
                 val b = raw.read()
@@ -200,8 +241,26 @@ class GuardSocket(
                 OP_CLOSE -> error("server menutup koneksi (code ${payload.size})")
                 OP_PING -> writeFrame(OP_PONG, ByteArray(0))
                 OP_PONG -> Unit
-                OP_TEXT -> onText(String(payload, Charsets.UTF_8))
-                else -> Unit // binary/continuation diabaikan; server hanya kirim teks
+                OP_TEXT, OP_BINARY -> {
+                    if (fin) {
+                        if (opcode == OP_TEXT) onText(String(payload, Charsets.UTF_8))
+                    } else {
+                        fragOpcode = opcode
+                        frag.reset()
+                        frag.write(payload)
+                    }
+                }
+
+                OP_CONT -> {
+                    frag.write(payload)
+                    if (fin) {
+                        val whole = frag.toByteArray()
+                        frag.reset()
+                        if (fragOpcode == OP_TEXT) onText(String(whole, Charsets.UTF_8))
+                    }
+                }
+
+                else -> Unit
             }
         }
     }
@@ -237,23 +296,41 @@ class GuardSocket(
         }
     }
 
+    /**
+     * Menulis satu frame WebSocket ke socket.
+     *
+     * RFC 6455 §5.3: SEMUA frame yang dikirim klien WAJIB dimask. Server yang
+     * benar menutup koneksi dengan error "MASK must be set" kalau menerima
+     * frame tanpa mask, jadi tanpa mask di sini Guard tidak akan pernah
+     * konek - bukan hanya gagal di satu skenario, tapi selalu.
+     *
+     * Mask diterapkan in-place: `payload` harus array milik pemanggil (semua
+     * call site lewat `toByteArray()` atau `ByteArray(0)` yang baru dibuat).
+     * Ini avoids salinan tambahan untuk frame foto berukuran MB di HP yang
+     * RAM-nya terbatas.
+     */
     private fun writeFrame(opcode: Int, payload: ByteArray) {
         val o = out ?: error("belum terhubung")
+        val mask = ByteArray(4).also { RNG.nextBytes(it) }
         synchronized(o) {
             o.write(0x80 or opcode)
             when {
-                payload.size < 126 -> o.write(payload.size)
+                payload.size < 126 -> o.write(0x80 or payload.size)
                 payload.size <= 0xFFFF -> {
-                    o.write(126)
+                    o.write(0x80 or 126)
                     o.write((payload.size shr 8) and 0xFF)
                     o.write(payload.size and 0xFF)
                 }
 
                 else -> {
-                    o.write(127)
+                    o.write(0x80 or 127)
                     val big = payload.size.toLong()
                     for (i in 7 downTo 0) o.write(((big shr (8 * i)) and 0xFF).toInt())
                 }
+            }
+            o.write(mask)
+            for (i in payload.indices) {
+                payload[i] = (payload[i].toInt() xor mask[i % 4].toInt()).toByte()
             }
             o.write(payload)
             o.flush()
@@ -274,6 +351,13 @@ class GuardSocket(
         /** 6 MB: foto JPEG 1,5 MB menjadi ~2 MB base64, masih aman. */
         const val MAX_FRAME = 6 * 1024 * 1024
         private const val MAX_BACKOFF_MS = 30_000L
+
+        /**
+         * Satu SecureRandom dipakai bersama, bukan dibuat per frame: masking
+         * terjadi pada setiap frame (termasuk PONG) dan membuat instance baru
+         * tiap frame itu mahal di HP kelas bawah.
+         */
+        private val RNG = SecureRandom()
 
         private const val OP_CONT = 0x0
         private const val OP_TEXT = 0x1

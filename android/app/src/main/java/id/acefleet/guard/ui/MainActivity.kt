@@ -2,6 +2,8 @@ package id.acefleet.guard.ui
 
 import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
@@ -12,6 +14,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import id.acefleet.guard.BuildConfig
 import id.acefleet.guard.GuardDeviceAdminReceiver
 import id.acefleet.guard.Logs
 import id.acefleet.guard.core.Config
@@ -120,16 +123,74 @@ class MainActivity : android.app.Activity() {
             },
         )
 
+        root.addView(
+            Button(this).apply {
+                text = "Aktifkan perlindungan (Device Admin)"
+                setOnClickListener { activateDeviceAdmin() }
+            },
+        )
+
         return ScrollView(this).apply { addView(root) }
+    }
+
+    /**
+     * Buka layar persetujuan Device Admin.
+     *
+     * Ini jalur proteksi yang TETAP bisa dipakai di HP yang sudah punya akun
+     * Google. Device Owner diblokir selama ada akun (aturan platform, bukan
+     * bug aplikasi), tapi Device Admin tidak. Dengan admin aktif, Guard bisa
+     * memblokir factory reset, mematikan kamera saat terkunci, mengunci layar,
+     * dan wipe.
+     *
+     * Yang TETAP tidak tersedia tanpa Device Owner: blokir uninstall, kiosk
+     * (lock task), suspend paket, dan pemberian izin tanpa dialog.
+     */
+    private fun activateDeviceAdmin() {
+        if (GuardDeviceAdminReceiver.isAdminActive(this)) {
+            toast("Device Admin sudah aktif")
+            return
+        }
+        runCatching {
+            startActivity(
+                Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN).apply {
+                    putExtra(
+                        DevicePolicyManager.EXTRA_DEVICE_ADMIN,
+                        GuardDeviceAdminReceiver.component(this@MainActivity),
+                    )
+                    putExtra(
+                        DevicePolicyManager.EXTRA_ADD_EXPLANATION,
+                        "Untuk memblokir factory reset dan melindungi unit rental. " +
+                            "Tanpa ini, penyewa bisa menghapus Guard.",
+                    )
+                },
+            )
+        }.onFailure {
+            Logs.w(TAG, "buka layar Device Admin gagal: ${it.message}")
+            toast("Tidak bisa membuka layar Device Admin")
+        }
     }
 
     private fun refresh() {
         val owner = GuardDeviceAdminReceiver.isDeviceOwner(this)
+        val adminActive = GuardDeviceAdminReceiver.isAdminActive(this)
+        val applied = runCatching { PolicyEngine(this).appliedRestrictionCount() }.getOrDefault(0)
+        val protection = when {
+            owner -> "device owner (penuh)"
+            // Device Admin aktif tapi 0 restriction berlaku: di Android 14+
+            // hampir semua batasan (termasuk factory reset) hanya untuk
+            // Device Owner. Jangan tulis "sebagian" - itu membuat operator
+            // mengira unitnya terlindungi padahal tidak.
+            adminActive && applied > 0 -> "device admin ($applied/7 batasan)"
+            adminActive -> "device admin saja (TIDAK melindungi)"
+            else -> "TIDAK AKTIF - unit belum terlindungi"
+        }
         val lines = buildList {
             add("device_id : ${cfg.deviceId ?: "-"}")
             add("nama      : ${cfg.namaDevice}")
             add("server    : ${cfg.wsUrl}")
             add("device owner : $owner")
+            add("admin aktif  : $adminActive (batasan berlaku: $applied/7)")
+            add("proteksi  : $protection")
             add("policy    : ${cfg.policyState} (kiosk=${cfg.kioskEnabled})")
             add("geofence  : ${if (cfg.geofenceArmed) "armed ${cfg.radiusM}m" else "off"}")
             add("watchdog  : ${cfg.watchdogMs} ms")
@@ -171,7 +232,11 @@ class MainActivity : android.app.Activity() {
 
     private fun postPair(code: String): JSONObject {
         val url = cfg.pairUrl
-        require(url.startsWith("https://")) { "endpoint pairing harus HTTPS" }
+        // Build release: pairing wajib HTTPS. Cleartext hanya untuk build debug
+        // supaya bisa diuji ke server broker di PC lokal yang tanpa TLS.
+        val allowed = url.startsWith("https://") ||
+            (BuildConfig.DEBUG && url.startsWith("http://"))
+        require(allowed) { "endpoint pairing harus HTTPS" }
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 10_000
@@ -201,7 +266,13 @@ class MainActivity : android.app.Activity() {
      * yang biasa bisa diketuk penyewa, dan tetap 100% API resmi Android.
      */
     private fun grantPermissionsAutomatically() {
-        if (!GuardDeviceAdminReceiver.isDeviceOwner(this)) return
+        if (!GuardDeviceAdminReceiver.isDeviceOwner(this)) {
+            // Belum Device Owner: setPermissionGrantState tidak berlaku sama
+            // sekali. Tanpa fallback ini Guard tidak pernah mendapat izin
+            // lokasi, jadi tidak ada yang terkirim ke server sama sekali.
+            requestRuntimePermissions()
+            return
+        }
         runCatching {
             val dpm = getSystemService(DevicePolicyManager::class.java) ?: return
             val admin: ComponentName = GuardDeviceAdminReceiver.component(this)
@@ -244,7 +315,39 @@ class MainActivity : android.app.Activity() {
     private fun toast(msg: String) =
         Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
 
+    /**
+     * Dialog izin biasa untuk unit yang belum Device Owner.
+     *
+     * Ini jalur、SNSono: andal untuk Device Owner, sedangkan dialog ini bisa
+     * ditolak/ditekuk penyewa. Setara的能力 tidak akan pernah ada tanpa Device
+     * Owner - jadi kalau kontrol penuh dibutuhkan, jalankan provisioning DPC.
+     *
+     * Lokasi background ("akses lokasi sepanjang waktu") tidak bisa diminta di
+     * dialog yang sama, jadi tetap harus lewat Device Owner.
+     */
+    private fun requestRuntimePermissions() {
+        val wanted = mutableListOf(
+            android.Manifest.permission.CAMERA,
+            android.Manifest.permission.ACCESS_FINE_LOCATION,
+            android.Manifest.permission.ACCESS_COARSE_LOCATION,
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            wanted += android.Manifest.permission.POST_NOTIFICATIONS
+        }
+        val missing = wanted
+            .filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+            .toTypedArray()
+        if (missing.isEmpty()) {
+            Logs.i(TAG, "izin runtime sudah lengkap")
+            return
+        }
+        Logs.i(TAG, "meminta izin runtime: ${missing.size} izin")
+        runCatching { requestPermissions(missing, REQ_RUNTIME) }
+            .onFailure { Logs.w(TAG, "requestPermissions gagal: ${it.message}") }
+    }
+
     companion object {
         const val TAG = "Main"
+        private const val REQ_RUNTIME = 4201
     }
 }
