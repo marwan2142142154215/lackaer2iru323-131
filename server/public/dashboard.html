@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex, nofollow" />
+<title>Fleet Guard</title>
+<style>
+  :root { color-scheme: dark; --bg:#0d1117; --card:#161b22; --line:#21262d; --txt:#e6edf3;
+          --mut:#8b949e; --grn:#3fb950; --red:#f85149; --yel:#d29922; --blu:#58a6ff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif; }
+  header { display:flex; align-items:center; gap:12px; padding:12px 16px; border-bottom:1px solid var(--line);
+           position:sticky; top:0; background:#0d1117ee; backdrop-filter:blur(6px); z-index:5; }
+  h1 { font-size:16px; margin:0; letter-spacing:.3px; }
+  main { padding:16px; max-width:1400px; margin:0 auto; }
+  .cards { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; }
+  .kpi { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 14px; min-width:110px; }
+  .kpi b { display:block; font-size:20px; }
+  .kpi span { color:var(--mut); font-size:12px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--mut); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+  tr:hover td { background:#1c2128; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
+  .on { background:var(--grn); } .off { background:#484f58; }
+  .pill { padding:2px 8px; border-radius:999px; font-size:11px; border:1px solid var(--line); }
+  .s-disewa{color:#d29922;border-color:#7d5c10} .s-hilang{color:#f85149;border-color:#8e2a24}
+  .s-tersedia{color:#58a6ff;border-color:#1f4c7d} .s-maintenance{color:#a371f7;border-color:#4b2a75}
+  button { background:#21262d; color:var(--txt); border:1px solid var(--line); border-radius:7px;
+           padding:4px 9px; cursor:pointer; font-size:12px; }
+  button:hover { border-color:#3fb950; }
+  .row-act { display:flex; gap:4px; }
+  #toast { position:fixed; right:14px; bottom:14px; background:var(--card); border:1px solid var(--line);
+           border-left:3px solid var(--blu); padding:9px 13px; border-radius:8px; display:none; max-width:70vw; }
+  #feed { max-height:190px; overflow:auto; font-family:ui-monospace,Consolas,monospace; font-size:11.5px;
+          color:var(--mut); background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px; }
+  #feed b { color:var(--txt); }
+  .login { max-width:340px; margin:12vh auto; background:var(--card); border:1px solid var(--line);
+           border-radius:14px; padding:22px; }
+  input { width:100%; padding:9px 11px; background:#0d1117; border:1px solid var(--line); color:var(--txt);
+          border-radius:8px; margin-bottom:9px; font-size:14px; }
+  .primary { width:100%; background:#238636; border:0; color:#fff; padding:10px; border-radius:8px;
+             font-weight:600; cursor:pointer; }
+  .hidden { display:none !important; }
+  a { color:var(--blu); }
+</style>
+</head>
+<body>
+<div id="login" class="login hidden">
+  <h1 style="margin-bottom:14px">Fleet Guard</h1>
+  <form id="loginForm">
+    <input id="u" placeholder="username" autocomplete="username" />
+    <input id="p" type="password" placeholder="password" autocomplete="current-password" />
+    <button class="primary" type="submit">Masuk</button>
+  </form>
+  <p id="loginErr" style="color:var(--red);font-size:12px"></p>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <h1>FLEET GUARD</h1>
+    <span id="conn" style="font-size:12px;color:var(--mut)">terhubung…</span>
+    <span style="flex:1"></span>
+    <span id="who" style="font-size:12px;color:var(--mut)"></span>
+    <button onclick="logout()">Keluar</button>
+  </header>
+  <main>
+    <div class="cards" id="kpis"></div>
+    <table>
+      <thead><tr>
+        <th>Device</th><th>Status</th><th>Kunci</th><th>Online</th><th>Baterai</th>
+        <th>Terakhir terlihat</th><th>Lokasi terakhir</th><th>Aksi</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <h3 style="font-size:13px;color:var(--mut);margin:18px 0 6px">Live activity</h3>
+    <div id="feed"></div>
+  </main>
+</div>
+
+<div id="toast"></div>
+
+<script>
+let DEV = [];
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function toast(t) { const e = $('#toast'); e.textContent = t; e.style.display = 'block';
+  clearTimeout(e._t); e._t = setTimeout(() => (e.style.display = 'none'), 4000); }
+
+function ago(iso) { if (!iso) return '—';
+  const s = Math.max(0, (Date.now() - new Date(iso)) / 1000);
+  if (s < 60) return Math.round(s) + 's lalu';
+  if (s < 3600) return Math.round(s / 60) + 'm lalu';
+  if (s < 86400) return Math.round(s / 3600) + 'j lalu';
+  return Math.round(s / 86400) + 'h lalu'; }
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { headers: { 'content-type': 'application/json' }, ...opts });
+  if (r.status === 401) { showLogin(); throw new Error('unauthorized'); }
+  return r.json();
+}
+
+function showLogin() { $('#login').classList.remove('hidden'); $('#app').classList.add('hidden'); }
+function showApp(user) { $('#login').classList.add('hidden'); $('#app').classList.remove('hidden');
+  $('#who').textContent = `${user.username} (${user.role})`; }
+
+$('#loginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const r = await fetch('/api/login', { method:'POST', headers:{'content-type':'application/json'},
+    body: JSON.stringify({ username: $('#u').value, password: $('#p').value }) });
+  const j = await r.json();
+  if (!r.ok) { $('#loginErr').textContent = j.error || 'gagal'; return; }
+  showApp(j.user); boot();
+});
+
+async function logout() { await fetch('/api/logout', { method:'POST' }); location.reload(); }
+
+async function boot() {
+  const d = await api('/api/devices');
+  DEV = d.devices; render(d.stat);
+  stream();
+}
+
+function render(stat) {
+  if (stat) {
+    $('#kpis').innerHTML = [
+      ['Total', stat.total], ['Online', stat.online], ['Tersedia', stat.tersedia],
+      ['Disewa', stat.disewa], ['Hilang', stat.hilang], ['Maintenance', stat.maintenance],
+    ].map(([k, v]) => `<div class="kpi"><b>${v ?? 0}</b><span>${k}</span></div>`).join('');
+  }
+  $('#rows').innerHTML = DEV.map((d) => `
+    <tr>
+      <td><b>${esc(d.nama)}</b><br><span style="color:var(--mut)">${esc(d.deviceId)}</span></td>
+      <td><span class="pill s-${d.statusSewa}">${esc(d.statusSewa)}</span>${d.penyewa ? ' ' + esc(d.penyewa) : ''}</td>
+      <td>${d.isLocked ? '🔒' : '🔓'} ${esc(d.policyState)}</td>
+      <td><span class="dot ${d.online ? 'on' : 'off'}"></span>${d.online ? 'online' : 'offline'}</td>
+      <td>${d.battery ?? '?'}%</td>
+      <td>${ago(d.lastSeenAt)}</td>
+      <td>${d.lastLocationTime ? ago(d.lastLocationTime) : '—'}</td>
+      <td><div class="row-act">
+        <button onclick="cmd('${d.deviceId}','lock')">Lock</button>
+        <button onclick="cmd('${d.deviceId}','unlock')">Unlock</button>
+        <button onclick="cmd('${d.deviceId}','locate')">Lokasi</button>
+        <button onclick="cmd('${d.deviceId}','ring')">Bunyi</button>
+        <button onclick="cmd('${d.deviceId}','camera_rear')">Kamera</button>
+      </div></td>
+    </tr>`).join('');
+}
+
+async function cmd(deviceId, type) {
+  try {
+    const r = await api(`/api/devices/${encodeURIComponent(deviceId)}/command`, {
+      method: 'POST', body: JSON.stringify({ type, payload: {} }) });
+    toast(`#${r.id} ${type} → ${r.status} (antrean server)`);
+  } catch (e) { toast('gagal: ' + e.message); }
+}
+
+function feed(html) { const f = $('#feed');
+  f.insertAdjacentHTML('afterbegin', `${new Date().toLocaleTimeString()} ${html}<br>`);
+  while (f.childNodes.length > 60) f.removeChild(f.lastChild); }
+
+function stream() {
+  const es = new EventSource('/api/stream');
+  es.onopen = () => ($('#conn').textContent = 'live ✓');
+  es.onerror = () => ($('#conn').textContent = 'puteus — mencoba lagi…');
+  const reload = () => api('/api/devices').then((d) => { DEV = d.devices; render(d.stat); });
+  es.addEventListener('status', reload);
+  es.addEventListener('online', (e) => { feed(`🟢 <b>online</b> ${esc(JSON.parse(e.data).nama || '')}`); reload(); });
+  es.addEventListener('offline', (e) => { feed(`⚫ <b>offline</b> ${esc(JSON.parse(e.data).deviceId)}`); reload(); });
+  es.addEventListener('event', (e) => { const d = JSON.parse(e.data);
+    feed(`${d.severity === 'info' ? '•' : '⚠️'} <b>${esc(d.event)}</b> ${esc(d.nama || d.deviceId)}`); });
+  es.addEventListener('location', (e) => { const d = JSON.parse(e.data);
+    feed(`📍 ${esc(d.deviceId)} ${d.lat?.toFixed(4)}, ${d.lng?.toFixed(4)}${d.breach ? ' ⚠️ LUAR GEOFENCE' : ''}`); });
+  es.addEventListener('command', (e) => { const d = JSON.parse(e.data);
+    feed(`⚙️ <b>${esc(d.type || '')}</b> #${d.id} ${esc(d.status)} (${esc(d.deviceId)})`); });
+  es.addEventListener('media', (e) => { const d = JSON.parse(e.data);
+    feed(`🖼 foto ${esc(d.kind)} ${esc(d.deviceId)} → /api/media/${d.id}`); });
+}
+
+(async function init() {
+  const s = await api('/api/session').catch(() => null);
+  if (s?.user) { showApp(s.user); boot(); } else { showLogin(); }
+  setInterval(() => { if (!$('#app').classList.contains('hidden')) boot(); }, 20000);
+})();
+</script>
+</body>
+</html>

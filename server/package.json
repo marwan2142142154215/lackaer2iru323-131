@@ -1,0 +1,29 @@
+{
+  "name": "fleet-guard-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Broker tunggal: APK Guard <-> Server PC <-> Bot Telegram",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "onboard": "node scripts/onboard.mjs",
+    "admin": "node scripts/admin.mjs",
+    "sim": "node scripts/simulator.mjs",
+    "selftest": "node scripts/selftest.mjs",
+    "bottest": "node scripts/bottest.mjs",
+    "backup": "node scripts/backup.mjs",
+    "purge": "node scripts/purge-devices.mjs",
+    "seed-test": "node scripts/seed-test-devices.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "qrcode": "^1.5.4"
+  },
+  "optionalDependencies": {
+    "pg": "^8.13.1"
+  }
+}

@@ -1,0 +1,3 @@
+-keep class id.acefleet.guard.GuardDeviceAdminReceiver { *; }
+-keep class id.acefleet.guard.** { *; }
+-dontwarn com.google.android.gms.**

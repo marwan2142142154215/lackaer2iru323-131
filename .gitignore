@@ -1,0 +1,56 @@
+# --- Rahasia: JANGAN pernah commit -----------------------------------------
+.env
+.env.local
+*.pem
+*.jks
+*.keystore
+
+# --- Data runtime -----------------------------------------------------------
+server/data/
+server/backups/
+server/out/
+server/logs/
+*.db
+*.db-wal
+*.db-shm
+*.enc
+keyring.json
+
+# --- Log uji ----------------------------------------------------------------
+logs-*.txt
+*.log
+
+# --- Node -------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+.npm/
+*.tsbuildinfo
+
+# --- Android ----------------------------------------------------------------
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/captures/
+android/*.iml
+android/app/release/
+android/app/debug/
+android/.kotlin/
+# Keystore release: TIDAK boleh masuk repo. Repo ini sudah menyertakan
+# keystore di .gitignore sejak awal - kalau pernah ter-commit, treat token
+# device dan password bot harus dirotasi.
+android/keystore/
+
+# --- Artefak build: TIDAK di-ignore ------------------------------------------
+# dist/*.apk sengaja ikut di-commit karena dua APK itu deliverable utama
+# repo ini (debug untuk uji paired, release untuk Device Owner).Ukurannya
+# ~9 MB total, masih jauh di bawah batas 100 MB per file GitHub.
+# Kalau nanti repo mulai membesar, pindahkan ke GitHub Releases.
+
+# --- OS / editor ------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

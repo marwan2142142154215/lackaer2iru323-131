@@ -1,0 +1,11 @@
+<resources>
+    <string name="app_name">Fleet Guard</string>
+    <string name="device_admin_description">Perlindungan anti-curia dan pelacakan unit rental.</string>
+
+    <string name="notif_channel_name">Pelacakan Fleet Guard</string>
+    <string name="notif_channel_desc">Notifikasi permanen selama Guard aktif. Menonaktifkannya akan dihentikan oleh sistem.</string>
+    <string name="notif_running">Fleet Guard aktif — perangkat terlindungi</string>
+
+    <string name="kiosk_title">Perangkat dikunci</string>
+    <string name="kiosk_body">Unit ini sedang tidak aktif / dalam masa sewa. Hubungi toko untuk informasi.</string>
+</resources>

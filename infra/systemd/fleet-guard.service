@@ -1,0 +1,62 @@
+# systemd service untuk Fleet Guard (server broker Node.js)
+#
+# Pakai kalau server dipindah ke Linux VPS / server di datacenter.
+# Di Windows, pakai infra\windows\install-scheduled-task.ps1 sebagai gantinya.
+#
+# Instalasi:
+#   sudo useradd --system --home /opt/fleet-guard --shell /usr/sbin/nologin fleetguard
+#   sudo mkdir -p /opt/fleet-guard/server
+#   sudo cp -r server/* /opt/fleet-guard/server/
+#   sudo cp infra/systemd/fleet-guard.service /etc/systemd/system/
+#   sudo chown -R fleetguard:fleetguard /opt/fleet-guard
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now fleet-guard
+
+[Unit]
+Description=Fleet Guard broker server (Node.js)
+Documentation=file:/opt/fleet-guard/server/README.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fleetguard
+Group=fleetguard
+WorkingDirectory=/opt/fleet-guard/server
+ExecStart=/usr/bin/node src/index.js
+Restart=always
+RestartSec=5
+# Backoff mencegah crash-loop membanjiri log saat database tidak terjangkau.
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+Environment=NODE_ENV=production
+# Token TIDAK ditulis di unit file. Pakai EnvironmentFile dengan izin ketat.
+EnvironmentFile=-/etc/fleet-guard/env
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fleet-guard
+
+# --- Hardening -------------------------------------------------------------
+# Yang boleh ditulis hanya folder data dan log.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/opt/fleet-guard/server/data /opt/fleet-guard/server/logs
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+# Batas sumber daya. 300 device butuh +-150 MB.
+MemoryMax=512M
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

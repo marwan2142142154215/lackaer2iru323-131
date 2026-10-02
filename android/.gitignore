@@ -1,0 +1,12 @@
+# Dibuat otomatis / tidak boleh masuk repo
+local.properties
+.gradle/
+build/
+*.iml
+.idea/
+
+# Secret produksi - JANGAN pernah di-commit
+*.jks
+*.keystore
+keystore.properties
+gradle.properties.local

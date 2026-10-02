@@ -1,0 +1,46 @@
+# Cloudflare Tunnel untuk Fleet Guard
+#
+# Dipakai kalau PC lokal tidak boleh / tidak bisa membuka port ke internet.
+# Cloudflare membuat koneksi KELUAR, lalu meneruskannya ke Node di localhost.
+#
+# Instalasi:
+#   cloudflared tunnel login
+#   cloudflared tunnel create fleet-guard
+#   lalu ganti <UUID_TUNNEL_ANDA> di bawah dengan UUID yang diberikan
+#
+# Jalankan:
+#   cloudflared --config infra\cloudflared\config.yml service run
+#
+# DNS (Cloudflare Dashboard -> DNS -> Add record -> CNAME):
+#   fleet.example.my.id  ->  <UUID_TUNNEL_ANDA>.cfargotunnel.com
+
+tunnel: <UUID_TUNNEL_ANDA>
+
+# Windows: path ke credentials json hasil `cloudflared tunnel create`.
+# Linux:   ~/.cloudflared/<UUID>.json
+credentials-file: C:\Users\<ANDA>\.cloudflared\<UUID_TUNNEL_ANDA>.json
+
+# Opsional: pakai token RPC tanpa file credentials (lebih mudah untuk service).
+# credentials-file lalu dihapus dan baris di bawah dipakai:
+# token: <TOKEN_DARI_DASHBOARD_TUNNEL>
+
+ingress:
+  - hostname: fleet.example.my.id
+    service: http://127.0.0.1:8787
+    originRequest:
+      connectTimeout: 10s
+      tcpKeepAlive: 30s
+      # keepAliveTimeout WAJIB besar: Guard menahan satu WSS persisten
+      # selama berhari-hari, dan dashboard memakai SSE.
+      keepAliveTimeout: 90s
+      # Jangan buffer respons; SSE dan media besar butuh streaming.
+      disableChunkedEncoding: false
+
+  # Fallback wajib. Tanpa baris ini, cloudflared menolak start.
+  - service: http_status:404
+
+# Log ke file supaya mudah dibiagnose saat unit tidak konek.
+loglevel: info
+logfile: C:\ProgramData\cloudflared\fleet-guard.log
+
+no-autoupdate: true

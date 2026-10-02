@@ -1,0 +1,45 @@
+# Caddy untuk Fleet Guard
+#
+# Caddy mengambil sertifikat Let's Encrypt otomatis begitu DNS mengarah ke IP
+# rumah, jadi tidak ada langkah renewal manual.
+#
+#   sudo cp infra/caddy/Caddyfile /etc/caddy/Caddyfile
+#   sudo systemctl reload caddy
+#
+# Kalau memakai Cloudflare Tunnel, bagian ini tidak dipakai - tunnel sudah
+# menangani TLS.
+
+fleet.example.my.id {
+    encode zstd gzip
+
+    reverse_proxy 127.0.0.1:8787 {
+        # WAJIB -1: tanpa ini, respons streaming (SSE dashboard) dan WebSocket
+        # ditahan di buffer sampai koneksi ditutup.
+        flush_interval -1
+
+        transport http {
+            dial_timeout 10s
+            # Device boleh menahan WSS berhari-hari.
+            read_timeout  0
+            write_timeout 0
+        }
+    }
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options    "nosniff"
+        Referrer-Policy           "no-referrer"
+        -Server
+    }
+
+    request_body {
+        max_size 8MB
+    }
+
+    log {
+        output file /var/log/caddy/fleet-guard.log {
+            roll_size 20MiB
+            roll_keep  14
+        }
+    }
+}

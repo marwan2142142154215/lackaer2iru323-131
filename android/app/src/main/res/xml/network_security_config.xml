@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Keamanan jaringan Guard:
+   1. Cleartext (HTTP) DIMATIKAN total - WSS saja.
+   2. Optionally pin sertifikat server (rekomendasi produksi).
+      Isi <pin-set> dengan SHA-256 dari sertifikat root/intermediary milik Anda
+      supaya APK tidak bisa_keepalive ke server palsu meski CA ditebah.
+   3. Optional: trust user CA untuk development lewat <debug-overrides>
+      (hanya berlaku pada build debug).
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <!-- Ganti dengan pin asli Anda sebelum produksi:
+    <pin-set expiration="2027-01-01">
+        <pin digest="SHA-256">BASE64_SHA256_DARI_SERTIFIKAT_ANDA=</pin>
+    </pin-set>
+    -->
+
+    <debug-overrides>
+        <trust-anchors>
+            <certificates src="user" />
+            <certificates src="system" />
+        </trust-anchors>
+    </debug-overrides>
+</network-security-config>
